@@ -96,8 +96,8 @@ def check_size(name: str, size: int):
 @dataclass(frozen=True)
 class DimSpec:
   """Parsed result of a dimension in a shape string."""
-  shape: str
-  sharding: Sequence[str]
+  shape: str # the dimension itself
+  sharding: Sequence[str] # how the dimension is sharded
 
   @staticmethod
   def parse(spec: str) -> 'DimSpec':
@@ -112,7 +112,7 @@ class DimSpec:
 @dataclass
 class ShapeSpec:
   """Parsed result of a shape string."""
-  dims: Sequence[DimSpec]
+  dims: Sequence[DimSpec] # sequence of dims with their own shardings
 
   @staticmethod
   def parse(spec: Union[bytes, str]) -> 'ShapeSpec':
@@ -124,13 +124,17 @@ class ShapeSpec:
     dims = spec.split()  # Split on spaces, trimming excess space
     result = []
     for dim in dims:
-      result.append(DimSpec.parse(dim))
+      result.append(DimSpec.parse(dim)) # get all the 
     return ShapeSpec(result)
 
   def partition_spec(self) -> jax.sharding.PartitionSpec:
+    """
+    prepeares a PartitionSpec with all the shardings from each DimSpec in the ShapeSpec
+    e.g. dims = [DimSpec('B', ['d']), DimSpec('T', []), DimSpec('D', ['t'])] => PartitionSpec('d', None, 't')
+    """
     result = []
     for dim_spec in self.dims:
-      if len(dim_spec.sharding) == 0:
+      if len(dim_spec.sharding) == 0: # no sharding
         result.append(None)
       elif len(dim_spec.sharding) == 1:
         result.append(dim_spec.sharding[0])

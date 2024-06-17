@@ -35,6 +35,10 @@ def psum_scatter(spec: str, x):
   after = shardtypes.ShapeSpec.parse(after)
   shardtypes.check(x.dtype, before, x)
   for i, (before_dim, after_dim) in enumerate(zip(before.dims, after.dims)):
+
+    # to perform the operation, the shapes of before_dim and after_dim must be the same
+    # AND the sharding of before_dim must be a prefix of the sharding of after_dim
+    
     # Check that before_dim.sharding is a prefix of after_dim.sharding
     before_n = len(before_dim.sharding)
     if before_dim.shape != after_dim.shape or after_dim.sharding[:before_n] != before_dim.sharding:

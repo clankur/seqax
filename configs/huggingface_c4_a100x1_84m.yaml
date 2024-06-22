@@ -2,7 +2,7 @@
 training:
   seed: 0
   tokens:
-    batch: 64
+    batch: 16
     len: 1024
 
   # AdamW optimizer parameters

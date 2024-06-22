@@ -33,6 +33,7 @@ from clearml import Task
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.tree_util import tree_leaves
+import jaxlib
 
 PRNGKey = Any
 
@@ -417,7 +418,7 @@ def main_contained(config, logger):
     # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
     c_training_step = training_step.lower(state, jnp.uint32(0), config.model, config.training, loader.load(0)).compile()
     date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-    training_io.save_hlo_svg(os.path.join(model_dir, f'training_step_optimized_hlo_{date}.svg'), c_training_step)
+    # training_io.save_hlo_svg(os.path.join(model_dir, f'training_step_optimized_hlo_{date}.svg'), c_training_step)
 
     for step in range(start_step, config.training.steps):
       if step % config.checkpoint_interval == 0 and step > start_step:

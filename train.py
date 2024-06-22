@@ -37,6 +37,15 @@ from jax.tree_util import tree_leaves
 PRNGKey = Any
 
 @dataclass(frozen=True)
+class BaseWidths:
+  d_model: int
+  n_q_per_kv: int
+  n_kv: int
+  d_head: int
+  d_ff: int
+
+
+@dataclass(frozen=True)
 class Hparams:
   d_model: int
   n_q_per_kv: int
@@ -46,7 +55,9 @@ class Hparams:
   vocab: int
   d_ff: int
   rope_max_timescale: int
-
+  attn_mult: float
+  output_mult: float
+  base_widths: BaseWidths
 
 @pytree_dataclass
 class Model:
@@ -79,16 +90,14 @@ class Model:
     # scale for tensors with d_model fan_in and truncated normal truncated to (-2, 2)
     d_model_scale = 1 / (math.sqrt(h.d_model) * truncated_normal_stddev)
 
-    w_kv_scale = d_model_scale
-    w_q_scale = d_model_scale / math.sqrt(h.d_head)
+    w_kv_scale = d_model_scale / h.d_head * h.attn_mult # bake mup's 1/(d_head)*attn_mult into the key
+    w_q_scale = 0
     total_head_dim = h.n_q_per_kv * h.n_kv * h.d_head
     w_o_scale = 1 / (math.sqrt(total_head_dim) * truncated_normal_stddev)
     w_up_scale = d_model_scale
     w_down_scale = 1 / (math.sqrt(h.d_ff) * truncated_normal_stddev)
-    unembed_scale = d_model_scale
+    unembed_scale = 0
 
-    w_kv_shape = (h.layers, 2, h.d_model, h.n_kv, h.d_head)
-    w_kv = w_kv_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_kv'), -2, 2, w_kv_shape, dtype=jnp.float32)
     w_q_shape = (h.layers, h.d_model, h.n_q_per_kv, h.n_kv, h.d_head)
     w_q = w_q_scale * jax.random.truncated_normal(fold_in_str(rng, 'w_q'), -2, 2, w_q_shape, dtype=jnp.float32)
     w_kv_shape = (h.layers, 2, h.d_model, h.n_kv, h.d_head)
@@ -189,7 +198,8 @@ class Model:
     x = shardops.all_gather('B/d L M/t -> B/d L M', x)
     ln = shardops.all_gather('M/t/d -> M', jnp.float32(self.final_layer_norm))
     x = jnp.bfloat16(rms_norm(x) * ln)
-    unembed = shardops.all_gather('V/t M/d -> V/t M', jnp.bfloat16(self.unembed))
+    output_scale =  jnp.float32(h.base_widths.d_model / h.d_model) * h.output_mult
+    unembed = shardops.all_gather('V/t M/d -> V/t M', jnp.bfloat16(self.unembed)) * output_scale
     logits = shardops.einsum_unreduced('B/d L M, V/t M -> B/d L V/t', x, unembed, preferred_element_type=jnp.float32)
 
     return logits
@@ -325,7 +335,27 @@ def training_step(state: State, step: u32[b''], h: Hparams, hparams: TrainingHpa
     new_ps = []
     new_mus = []
     new_nus = []
-    for p, g, mu, nu, spec in zip(tree_leaves(state.weights), grad_leaves, tree_leaves(state.adam_mu), tree_leaves(state.adam_nu), tree_leaves(shardtypes.make_partition_specs(State))):
+
+    bw = h.base_widths
+    lr_scales = Model(
+      embed=jnp.float32(1.0),
+      unembed=1.0,
+      ln1=1.0,
+      ln2=1.0,
+      final_layer_norm=1.0,
+      w_q=bw.d_model / h.d_model,
+      w_kv=bw.d_model / h.d_model,
+      w_o=(bw.n_q_per_kv * bw.n_kv * bw.d_head) / (h.n_q_per_kv * h.n_kv * h.d_head),
+      w_gate=bw.d_model / h.d_model,
+      w_up=bw.d_model / h.d_model,
+      w_down=bw.d_ff / h.d_ff,
+    )
+    for p, g, mu, nu, spec, scale in zip(tree_leaves(state.weights),
+                                         grad_leaves,
+                                         tree_leaves(state.adam_mu),
+                                         tree_leaves(state.adam_nu),
+                                         tree_leaves(shardtypes.make_partition_specs(State)),
+                                         tree_leaves(lr_scales)):
       assert shardtypes.is_fully_sharded(spec), 'Weight update is only correctly scaled for fully sharded weights.'
       # Gradient clipping
       g = g * rescale
@@ -340,7 +370,7 @@ def training_step(state: State, step: u32[b''], h: Hparams, hparams: TrainingHpa
       # Weight decay
       g += hparams.weight_decay * p
       # Learning rate
-      g *= lr
+      g *= lr * scale
 
       # Apply update
       new_ps.append(p - g)

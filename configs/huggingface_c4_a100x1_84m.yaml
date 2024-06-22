@@ -34,6 +34,16 @@ model:
   vocab: 32768
   rope_max_timescale: 10000
 
+  attn_mult: 11.3 # should be sqrt(d_head) for "SP"
+  output_mult: 22.62 # should be sqrt(d_model) for "SP"
+
+  base_widths:
+    d_model: 512
+    n_q_per_kv: 1
+    n_kv: 8
+    d_head: 128
+    d_ff: 4096
+
 paths:
   # can also be a path to GCS. IE 'gcs://your_bucket/your_output_path' 
    root_working_dir: '~/seqax_outputs'
@@ -50,7 +60,7 @@ hf_dataset:
   path: allenai/c4
   name: en
   num_workers: 64
-  tokenizer: mistralai/Mistral-7B-v0.1 # may require huggingface-cli login
+  tokenizer: NousResearch/Nous-Hermes-llama-2-7b # may require huggingface-cli login
   sequences_packed_per_batch: 120
 
 

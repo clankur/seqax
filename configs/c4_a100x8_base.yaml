@@ -32,9 +32,9 @@ training:
 hf_dataset:
   path: allenai/c4
   name: en
-  num_workers: 64
+  num_workers: 500 
   tokenizer: NousResearch/Nous-Hermes-llama-2-7b # may require huggingface-cli login
-  sequences_packed_per_batch: 120
+  sequences_packed_per_batch: 1280
 
 paths:
   # root_working_dir can also be a path on a local filesystem

@@ -25,12 +25,15 @@ model:
   attn_mult: 1.
   output_mult: 1.
 
-  base_widths:
+  base:
     d_model: 256
     n_q_per_kv: 2
     n_kv: 2
     d_head: 32
+    layers: 2
     d_ff: 1024
+  a_attn: 1
+  a_output: 1
 
 paths:
   root_working_dir: '/tmp'

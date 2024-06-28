@@ -22,15 +22,6 @@ model:
   vocab: 32000 
   d_ff: 1024
   rope_max_timescale: 256
-  attn_mult: 1.
-  output_mult: 1.
-
-  base_widths:
-    d_model: 256
-    n_q_per_kv: 2
-    n_kv: 2
-    d_head: 32
-    d_ff: 1024
 
 paths:
   root_working_dir: '/tmp'

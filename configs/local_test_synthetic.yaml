@@ -14,14 +14,14 @@ training:
     len: 64
 
 model:
-  d_model: 256
-  n_q_per_kv: 2
-  n_kv: 2
-  d_head: 32
-  layers: 2
-  vocab: 32000 
-  d_ff: 1024
-  rope_max_timescale: 256
+  d_model: 128
+  n_q_per_kv: 1
+  n_kv: 4 
+  d_head: 32 
+  layers: 8
+  d_ff: 1024 
+  vocab: 32768
+  rope_max_timescale: 10000
 
 paths:
   root_working_dir: '/tmp'

@@ -20,22 +20,13 @@ training:
   learning_rate: 3.e-4
   cosine_learning_rate_final_fraction: 0.1 
 
-# flat_tokens:
-#   # filespec can also be a path on a local filesystem
-#   filespec: 'gcs://flat_tokens/20b'   # Fill in
-#   streams: 1
-#   read_blocks_per_shuffle_buffer: 128
-#   sequences_per_read_block: 1024
-#   seed: 0
-#   sequence_packing: true
-
-hf_dataset:
-  path: allenai/c4
-  name: en
-  num_workers: 64 
-  tokenizer: NousResearch/Nous-Hermes-llama-2-7b # may require huggingface-cli login
-  sequences_packed_per_batch: 1200
+flat_tokens:
+  filespec: 'gcs://flat_tokens/20b'   # Fill in
+  streams: 1
+  read_blocks_per_shuffle_buffer: 128
+  sequences_per_read_block: 1024
   seed: 0
+  sequence_packing: true
 
 paths:
   # root_working_dir can also be a path on a local filesystem

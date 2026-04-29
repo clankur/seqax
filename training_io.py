@@ -35,11 +35,10 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger, output: PyTree, wandb_run=None):
+def log(step: int, output: PyTree, wandb_run=None):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays.
 
     Args:
-        logger: ClearML Logger instance, or None.
         wandb_run: wandb Run instance, or None.
     """
     if jax.process_index() == 0:
@@ -48,12 +47,9 @@ def log(step: int, logger, output: PyTree, wandb_run=None):
             path = jax.tree_util.keystr(path)
             arr = jax.device_get(arr)
             if arr.shape == () and arr.dtype == jnp.float32:
-                if logger:
-                    logger.report_scalar(title=path, series=path, value=arr, iteration=step)
                 metrics_dict[path] = float(arr)
             elif arr.dtype == jnp.float32:
-                if logger:
-                    logger.report_histogram(title=path, series=path, values=arr, iteration=step)
+                pass
             else:
                 raise ValueError(f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}.")
         if wandb_run is not None:

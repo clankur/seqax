@@ -152,4 +152,4 @@ See the notes on the loss-reduction ordering, the `endpoint=False` RoPE quirk, t
 - Sharding annotations use bytes-strings (`b"..."`) inside `pytree_dataclass` fields so they survive `typeguard`.
 - Mesh axis names are conventionally `d` (data/FSDP) and `t` (tensor parallel). New axes should be added consciously since they propagate through every annotation.
 - Pipeline parallelism is **not** implemented — README explicitly notes this is the scaling ceiling.
-- ClearML is imported unconditionally in `train.py` for experiment tracking.
+- wandb is used for experiment tracking; `config.wandb_project` enables it.

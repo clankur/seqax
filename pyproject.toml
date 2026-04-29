@@ -13,8 +13,6 @@ dependencies = [
     "fsspec[gcs]",
     "einops",
     "hydra-core",
-    "clearml",
-    "clearml-agent",
     "typeguard==4.1.5",
     # Huggingface data loader path
     "transformers",

@@ -16,20 +16,20 @@ Whenever you run an experiment configuration, run it against `local_test_synthet
 
 ### Install
 
-CPU dev:
+Requires Python >= 3.11. CPU dev:
 
 ```
-python -m pip install -r requirements-cpu.txt
+uv sync --extra cpu
 ```
 
-Also requires system `graphviz` (e.g. `brew install graphviz`). For GPU/TPU, JAX/jaxlib must be reinstalled per the JAX install docs.
+Also requires system `graphviz` (e.g. `brew install graphviz`). For GPU/TPU use `uv sync --extra gpu` or `uv sync --extra tpu`.
 
 ### Local CPU smoke test
 
 Simulates 8 devices via XLA flag:
 
 ```
-XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
+XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
 ```
 
 Each file in `configs/` lists its own intended launch command at the top — copy from there for real runs. `paths.model_name` controls the checkpoint subdirectory under `paths.root_working_dir` (default `/tmp`); change it per run.
@@ -37,7 +37,7 @@ Each file in `configs/` lists its own intended launch command at the top — cop
 ### Pre-tokenize data
 
 ```
-python -m tools.huggingface_to_flat_tokens
+uv run python -m tools.huggingface_to_flat_tokens
 ```
 
 Uses a config from `tools/configs/`. Install `tools/requirements.txt` first.
@@ -47,8 +47,8 @@ Uses a config from `tools/configs/`. Install `tools/requirements.txt` first.
 CI enforces this via `.github/workflows`:
 
 ```
-ruff check
-ruff format
+uvx ruff check
+uvx ruff format
 ```
 
 Ruff config lives in `pyproject.toml` (line-length 120, py310, rules `E4,E7,E9,F,I`).
@@ -88,7 +88,7 @@ The important pieces:
 - **`jax_extra.py`** — `@explicit_activation_checkpointing` + `save_for_backward`. By default JAX saves all intermediates and lets XLA prune; this decorator flips the policy so **only** function arguments and explicitly marked values survive into the backward pass. Use `save_for_backward(...)` deliberately — it is the memory knob.
 - **`input_loader.py`** — two data paths behind `get_loader`: `FlatTokensParams` (zarr files in the [flat-tokens format](docs/flat-tokens.md), supports exact resume from checkpoint, sequence packing) and `HuggingFaceDataParams` (streaming, convenient for experiments but lossy at batch boundaries and not resumable).
 - **`training_io.py`** — checkpoint read/write in the [pytree-zarr format](docs/pytree-zarr-checkpoint.md), plus profile/HLO-graph dumping. Each run writes an XLA Perfetto trace and an optimized-HLO SVG into the model dir.
-- **`init_seqax.py`** — must be imported **before** `jax`/`jax.numpy` because it sets XLA flags. `train.py` imports it first; preserve that ordering in any new entrypoint.
+- **`init_seqax.py`** — must be imported **before** `jax`/`jax.numpy` because it sets environment variables (NCCL tuning, libtpu args). `train.py` imports it first; preserve that ordering in any new entrypoint.
 - **`configs/`** — Hydra configs. `base.yaml` is the schema; the rest inherit via `defaults: [base, _self_]`. `mesh.d` is the FSDP/data axis, `mesh.t` is the tensor-parallel axis; their product must equal total devices.
 - **`tools/`** — offline data-prep scripts (separate `requirements.txt`).
 

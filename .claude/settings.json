@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train *)"
+      "Bash(XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train *)"
     ]
   }
 }

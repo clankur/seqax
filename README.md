@@ -44,10 +44,36 @@ seqax is written in a style that makes the important information visible, rather
 For development and testing you can run on CPU. Typically you'd use our synthetic dataset (which is [checked into this repository](/synthetic_dataset.zarr)) or the [Huggingface data loader](#data-loaders) and you'd set XLA flags to simulate multiple devices so as to test that parallelism is working as intended:
 
 ```
-XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
+XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000
 ```
 
 The `paths.model_name` flag specifies which subdirectory on disk (inside `/tmp`) to write model checkpoints to. You'll typically want to change this when starting a new model run.
+
+### Sharding tutorial
+
+There is an interactive tutorial that walks through how sharded and tiled matmuls work. You can run it as a Jupyter notebook or as an IPython script:
+
+```bash
+XLA_FLAGS=--xla_force_host_platform_device_count=8 jupyter notebook sharding_tutorial.ipynb
+```
+
+### Flash attention
+
+To use flash attention, add `+model.use_flash_attention=true` to your command:
+
+```
+XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000 +model.use_flash_attention=true
+```
+
+Flash attention uses custom Pallas kernels ([`flash_attention.py`](/flash_attention.py)) to compute attention without materializing the full attention matrix, reducing memory usage from O(L^2) to O(L). It works on both GPU (native Pallas kernels) and CPU (via Pallas interpret mode). Note that flash attention applies causal masking but does not support segment masking for packed sequences.
+
+### Logging to Weights & Biases
+
+To log metrics to [Weights & Biases](https://wandb.ai), add `+wandb_project=<project_name>`:
+
+```
+XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000 +wandb_project=seqax
+```
 
 ### Run on GPUs
 

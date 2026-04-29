@@ -19,7 +19,6 @@ import jax.numpy as jnp
 import jax.profiler
 import numpy as np
 import zarr
-from clearml import Logger
 from jax.experimental import multihost_utils
 from jax.lib import xla_client
 from numcodecs import blosc
@@ -36,8 +35,13 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger: Logger, output: PyTree):
-    """Logs the output of a training step. The output must be a PyTree of f32 arrays."""
+def log(step: int, logger, output: PyTree, wandb_run=None):
+    """Logs the output of a training step. The output must be a PyTree of f32 arrays.
+
+    Args:
+        logger: ClearML Logger instance, or None.
+        wandb_run: wandb Run instance, or None.
+    """
     if jax.process_index() == 0:
         metrics_dict = {}
         for path, arr in jax.tree_util.tree_leaves_with_path(output):
@@ -52,6 +56,8 @@ def log(step: int, logger: Logger, output: PyTree):
                     logger.report_histogram(title=path, series=path, values=arr, iteration=step)
             else:
                 raise ValueError(f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}.")
+        if wandb_run is not None:
+            wandb_run.log(metrics_dict, step=step)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] Step {step}: {metrics_dict}")
 
@@ -86,7 +92,9 @@ def load_checkpoint_if_it_exists(checkpoint_dir: str, state: PyTree, config: IOC
                     checkpoint_number = int(os.path.basename(c))
                 except ValueError:
                     continue
-                root = zarr.open_group(zarr.storage.FSStore(c, fs=fs))
+                protocol = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+                zarr_path = c if protocol in ("file", "local", "") else f"{protocol}://{c}"
+                root = zarr.open_group(zarr_path, mode="r")
                 if "write_completed" not in root.attrs:
                     print(f"zarr 'write_completed' marker is missing in checkpoint {c}; skipping.")
                     continue
@@ -166,7 +174,7 @@ def save_zarr(filename: str, state: PyTree, config: IOConfig):
         for path, arr in state:
             path = jax.tree_util.keystr(path)
             chunk_shape = arr.sharding.shard_shape(arr.shape)
-            root.empty(path, shape=arr.shape, chunks=chunk_shape, dtype=arr.dtype)
+            root.create_array(name=path, shape=arr.shape, chunks=chunk_shape, dtype=arr.dtype)
     multihost_utils.sync_global_devices("save_zarr_begin")
 
     root = zarr.open_group(filename, mode="r+")

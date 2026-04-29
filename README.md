@@ -21,9 +21,23 @@ seqax is written in a style that makes the important information visible, rather
 ### Installation
 
 1. Install `graphviz` from your system package manager: e.g. `brew install graphviz` or `apt install graphviz`.
-2. Install Python dependencies, typically inside a virtualenv: `python -m pip install -r requirements-cpu.txt`.
+2. Install Python dependencies with [uv](https://docs.astral.sh/uv/), picking the extra that matches your hardware:
 
-   NOTE: the `requirements-cpu.txt` is configured for CPU-based installation. For GPU or TPU installation, you may need a different install of JAX and jaxlib. Consult the [JAX install documentation](https://jax.readthedocs.io/en/latest/installation.html). If your GPU environment has a Torch-GPU installation, you may need to switch it to a Torch-CPU installation to avoid conflicts with JAX-GPU.
+   ```
+   uv sync --extra cpu   # local dev on Mac/Linux CPU
+   uv sync --extra gpu   # CUDA 12 GPUs
+   uv sync --extra tpu   # TPUs
+   ```
+
+   The `cpu` / `gpu` / `tpu` extras are declared mutually exclusive in `pyproject.toml`, so only one can be active at a time. `torch` is always pinned to the CPU build since it's only used by the Huggingface data loader and would otherwise fight with `jax[cuda12]` over CUDA wheels.
+
+   If you prefer plain pip, the repo also ships generated lockfiles — `requirements-cpu.txt`, `requirements-gpu.txt`, `requirements-tpu.txt` — that you can `pip install -r`. **Do not edit these by hand**; regenerate them from `pyproject.toml` with:
+
+   ```
+   uv pip compile pyproject.toml --extra cpu --universal                                   -o requirements-cpu.txt
+   uv pip compile pyproject.toml --extra gpu --python-platform x86_64-unknown-linux-gnu    -o requirements-gpu.txt
+   uv pip compile pyproject.toml --extra tpu --python-platform x86_64-unknown-linux-gnu    -o requirements-tpu.txt
+   ```
 
 ### Run on CPU for local development
 

@@ -1,3 +1,71 @@
+[project]
+name = "seqax"
+version = "0.1.0"
+description = "seqax = sequence modeling + JAX. Small-to-medium-scale LLM pretraining."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+# Shared runtime deps across every hardware variant. Anything hardware-specific
+# (jax backend, libtpu) lives in the optional-dependencies extras below.
+dependencies = [
+    "zarr",
+    "fsspec[gcs]",
+    "einops",
+    "hydra-core",
+    "clearml",
+    "clearml-agent",
+    "typeguard==4.1.5",
+    # Huggingface data loader path
+    "transformers",
+    "datasets",
+    "torch",
+]
+
+[project.optional-dependencies]
+# Pick exactly one of these extras per environment. They are declared
+# conflicting below so uv will refuse to resolve more than one at a time.
+cpu = [
+    "jax[cpu]==0.4.30",
+]
+gpu = [
+    "jax[cuda12]==0.4.30",
+]
+tpu = [
+    "jax==0.4.30",
+    "jaxlib==0.4.30",
+    "libtpu-nightly==0.1.dev20240617",
+]
+
+[tool.uv]
+# Mark the three hardware extras as mutually exclusive so `uv sync --extra cpu`
+# and `uv sync --extra gpu` don't accidentally coexist in the same lockfile.
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+        { extra = "tpu" },
+    ],
+]
+
+[tool.uv.sources]
+# libtpu-nightly is published on Google's libtpu index, not PyPI.
+libtpu-nightly = { index = "libtpu" }
+# Force the CPU torch build everywhere — the Huggingface data loader needs
+# torch, but we never want it to pull CUDA wheels and fight with jax[cuda12].
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "libtpu"
+url = "https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.ruff]
 line-length = 120
 target-version = 'py310'

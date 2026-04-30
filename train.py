@@ -30,7 +30,7 @@ import training_io
 from flash_attention import attention as flash_attention_fn
 from input_loader import FlatTokensParams, HuggingFaceDataParams, TokenBatch, TokenBatchParams, get_loader
 from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
-from shardlib.shardtypes import Array, bf16, bool_, f32, make_shardings, pytree_dataclass, u32
+from shardlib.shardtypes import Array, bf16, bool_, f32, i32, make_shardings, pytree_dataclass, u32
 
 shardtypes.register_with_typeguard()
 PRNGKey = Any
@@ -47,10 +47,15 @@ class Hparams:
     d_ff: int
     rope_max_timescale: int
     use_flash_attention: bool = False
+    window_size: Optional[int] = None
+    n_kv_caches: Optional[int] = None
+    reuse_kv_map: Optional[tuple] = None
+    sa_layers: Optional[tuple] = None
 
 
 @pytree_dataclass
 class TransformerLayer:
+    cache_idx: f32[b""]
     ln1: f32[b"d_model/t/d"]
     ln2: f32[b"d_model/t/d"]
     w_q: f32[b"d_model/d n_q_per_kv n_kv/t d_head"]
@@ -115,10 +120,16 @@ class Model:
         unembed = unembed_scale * jax.random.truncated_normal(
             fold_in_str(rng, "unembed"), -2, 2, (h.vocab, h.d_model), dtype=jnp.float32
         )
+        if h.reuse_kv_map is not None:
+            cache_idx = jnp.array([h.reuse_kv_map[i] for i in range(h.layers)], dtype=jnp.float32)
+        else:
+            cache_idx = jnp.arange(h.layers, dtype=jnp.float32)
+
         arrays = Model(
             embed=embed,
             unembed=unembed,
             transformer=Transformer(
+                cache_idx=cache_idx,
                 ln1=ln1,
                 ln2=ln2,
                 w_q=w_q,
@@ -140,7 +151,7 @@ class Model:
         x = shardops.index_unreduced("[V/t] M, B/d L -> B/d L M", embed, ids)
         x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
 
-        L = ids.shape[1]
+        B, L = ids.shape
         if not h.use_flash_attention:
             segment_ids = jnp.cumsum(is_seq_start, axis=1)
             segment_mask: bool_[b"B/d L L"] = segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
@@ -154,10 +165,32 @@ class Model:
 
         rope_table = RopeTable.create(L, h)
 
+        # Mixed attention: precompute sliding window mask and KV cache when enabled.
+        # sa_layers use local (sliding window) attention; other layers use full causal attention
+        # and can share KV caches via reuse_kv_map.
+        # Always define these so `nonlocal` in loop_body can reference them.
+        kv_cache = None
+        cache_initialized = None
+        local_mask = None
+        if h.n_kv_caches is not None and not h.use_flash_attention:
+            local_mask: bool_[b"1 L L 1 1"] = jnp.triu(jnp.ones((L, L), dtype=jnp.bool_), 1 - h.window_size)[
+                jnp.newaxis, ..., jnp.newaxis, jnp.newaxis
+            ]
+            kv_cache = jnp.zeros((h.n_kv_caches, 2, B, L, h.n_kv, h.d_head), dtype=jnp.bfloat16)
+            kv_cache = shardops.psum_scatter("n_kv_caches k_v B/d L K D -> n_kv_caches k_v B/d L K/t D", kv_cache)
+            cache_initialized = jnp.zeros((h.n_kv_caches,), dtype=jnp.bool_)
+
         ##### Transformer blocks.
         @explicit_activation_checkpointing
         @typechecked
-        def loop_body(x: bf16[b"B/d L M/t"], layer_weights: TransformerLayer) -> Tuple[bf16[b"B/d L M/t"], Tuple[()]]:
+        def loop_body(
+            carry: Tuple[bf16[b"B/d L M/t"], i32[b""]],
+            layer_weights: TransformerLayer,
+        ) -> Tuple[Tuple[bf16[b"B/d L M/t"], i32[b""]], Tuple[()]]:
+            nonlocal kv_cache, cache_initialized
+
+            x, layer_idx = carry
+
             # Pre-attention RMSNorm
             ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
             gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -169,6 +202,31 @@ class Model:
             q = rope_table.apply("L D -> 1 L 1 1 D", q)
             w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
             k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv)
+
+            if h.n_kv_caches is not None:
+                # Populate cache on first visit to this slot; later layers sharing the
+                # same cache_idx reuse the already-populated values.
+                cache_idx = jnp.int32(layer_weights.cache_idx)
+
+                def populate_cache(kv_cache, cache_initialized, k, v):
+                    kv_cache = kv_cache.at[cache_idx, 0].set(jnp.bfloat16(k))
+                    kv_cache = kv_cache.at[cache_idx, 1].set(jnp.bfloat16(v))
+                    cache_initialized = cache_initialized.at[cache_idx].set(True)
+                    return kv_cache, cache_initialized
+
+                kv_cache, cache_initialized = jax.lax.cond(
+                    cache_initialized[cache_idx],
+                    lambda kv_cache, cache_initialized, k, v: (kv_cache, cache_initialized),
+                    populate_cache,
+                    kv_cache,
+                    cache_initialized,
+                    k,
+                    v,
+                )
+                # Read from cache — may be this layer's own KV or a shared earlier layer's.
+                k = kv_cache[cache_idx, 0]
+                v = kv_cache[cache_idx, 1]
+
             k = save_for_backward(k)
             v = save_for_backward(v)
             k = rope_table.apply("L d -> 1 L 1 d", k)
@@ -181,7 +239,17 @@ class Model:
                     k,
                     preferred_element_type=jnp.float32,
                 )
-                logits = jnp.where(causal_mask, logits, -1e10)
+                if h.n_kv_caches is not None:
+                    # sa_layers use sliding window + causal; others use full causal.
+                    use_local = jnp.isin(layer_idx, jnp.array(h.sa_layers or ()))
+                    attn_mask: bool_[b"B/d L L 1 1"] = jax.lax.select(
+                        use_local,
+                        jnp.logical_and(causal_mask, local_mask),
+                        causal_mask,
+                    )
+                    logits = jnp.where(attn_mask, logits, -1e10)
+                else:
+                    logits = jnp.where(causal_mask, logits, -1e10)
                 probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
                 attn_out = shardops.einsum_unreduced(
                     "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
@@ -206,9 +274,9 @@ class Model:
             ffn_out = shardops.einsum_unreduced("B/d L F/t, M F/t -> B/d L M", y, w_down)
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
-            return jnp.bfloat16(x + ffn_out), ()
+            return (jnp.bfloat16(x + ffn_out), layer_idx + 1), ()
 
-        x, () = jax.lax.scan(loop_body, jnp.bfloat16(x), self.transformer)
+        (x, _), () = jax.lax.scan(loop_body, (jnp.bfloat16(x), jnp.int32(0)), self.transformer)
 
         ##### Final layernorm and output projection.
         x = shardops.all_gather("B/d L M/t -> B/d L M", x)
@@ -362,17 +430,37 @@ def training_step(
         global_norm = jnp.sqrt(global_norm_square)
         rescale = jnp.minimum(1.0, 1.0 / global_norm)
 
+        # Per-leaf learning rate scales: cache_idx is metadata (not a trained parameter),
+        # so it gets lr_scale=0 making the Adam update a no-op.
+        lr_scales = Model(
+            embed=1.0,
+            unembed=1.0,
+            transformer=Transformer(
+                cache_idx=0.0,
+                ln1=1.0,
+                ln2=1.0,
+                w_q=1.0,
+                w_kv=1.0,
+                w_o=1.0,
+                w_gate=1.0,
+                w_up=1.0,
+                w_down=1.0,
+            ),
+            final_layer_norm=1.0,
+        )
+
         new_ps = []
         new_mus = []
         new_nus = []
-        for p, g, mu, nu, spec in zip(
+        for p, g, mu, nu, spec, lr_scale in zip(
             tree_leaves(state.weights),
             grad_leaves,
             tree_leaves(state.adam_mu),
             tree_leaves(state.adam_nu),
             tree_leaves(shardtypes.make_partition_specs(State)),
+            tree_leaves(lr_scales),
         ):
-            assert shardtypes.is_fully_sharded(spec), (
+            assert shardtypes.is_fully_sharded(spec) or lr_scale == 0.0, (
                 "Weight update is only correctly scaled for fully sharded weights."
             )
             # Gradient clipping
@@ -387,8 +475,8 @@ def training_step(
             g = mu_hat / (jnp.sqrt(nu_hat + hparams.adam_eps_root) + hparams.adam_eps)
             # Weight decay
             g += hparams.weight_decay * p
-            # Learning rate
-            g *= lr
+            # Learning rate (lr_scale=0 for non-trained metadata like cache_idx)
+            g *= lr * lr_scale
 
             # Apply update
             new_ps.append(p - g)

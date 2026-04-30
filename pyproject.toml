@@ -22,6 +22,16 @@ dependencies = [
     "torch",
     "wandb",
     "jupyter",
+    "matplotlib>=3.10.9",
+]
+
+[dependency-groups]
+# Tools needed for local development that aren't part of the runtime.
+# `pyyaml` is required by Quarto's bundled jupyter kernel when previewing
+# .qmd files in `docs/`.
+dev = [
+    "pyyaml",
+    "plotly",
 ]
 
 [project.optional-dependencies]

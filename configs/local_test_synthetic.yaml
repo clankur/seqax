@@ -22,6 +22,8 @@ model:
   vocab: 1280
   d_ff: 1024
   rope_max_timescale: 256
+  apply_rope: true
+  apply_alibi: false
 
 paths:
   root_working_dir: '/tmp'

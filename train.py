@@ -47,6 +47,14 @@ class Hparams:
     d_ff: int
     rope_max_timescale: int
     use_flash_attention: bool = False
+    apply_rope: bool = True
+    apply_alibi: bool = False
+
+    def __post_init__(self):
+        # ALiBi adds a bias to the logits matrix, which is incompatible with flash attention's fused kernel.
+        assert not (self.apply_alibi and self.use_flash_attention), (
+            "ALiBi is incompatible with flash attention: ALiBi needs to add bias to logits before softmax."
+        )
 
 
 @pytree_dataclass
@@ -152,7 +160,11 @@ class Model:
             ]
             causal_mask: bool_[b"B/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
 
-        rope_table = RopeTable.create(L, h)
+        if h.apply_rope:
+            rope_table = RopeTable.create(L, h)
+
+        if h.apply_alibi:
+            alibi = Alibi.create(h)
 
         ##### Transformer blocks.
         @explicit_activation_checkpointing
@@ -166,12 +178,14 @@ class Model:
             # Attention, using Grouped Query Attention and RoPE position embeddings.
             w_q = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_q))
             q = save_for_backward(shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q))
-            q = rope_table.apply("L D -> 1 L 1 1 D", q)
+            if h.apply_rope:
+                q = rope_table.apply("L D -> 1 L 1 1 D", q)
             w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
             k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv)
             k = save_for_backward(k)
             v = save_for_backward(v)
-            k = rope_table.apply("L d -> 1 L 1 d", k)
+            if h.apply_rope:
+                k = rope_table.apply("L d -> 1 L 1 d", k)
             if h.use_flash_attention:
                 attn_out = flash_attention_fn(jnp.bfloat16(q), jnp.bfloat16(k), jnp.bfloat16(v))
             else:
@@ -182,7 +196,12 @@ class Model:
                     preferred_element_type=jnp.float32,
                 )
                 logits = jnp.where(causal_mask, logits, -1e10)
-                probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+                if h.apply_alibi:
+                    logits = alibi.apply(logits, L)
+                if h.apply_alibi:
+                    probs = jnp.bfloat16(quiet_softmax(logits, axis=2))
+                else:
+                    probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
                 attn_out = shardops.einsum_unreduced(
                     "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
                 )
@@ -274,10 +293,41 @@ class RopeTable:
         return jnp.append(r1, r2, axis=-1)
 
 
+@pytree_dataclass
+class Alibi:
+    slopes: f32[b"K/t"]
+
+    @staticmethod
+    def create(h: Hparams) -> "Alibi":
+        start = 2.0 ** (-(2.0 ** (-(jnp.log2(jnp.float32(h.n_kv)) - 3))))
+        t_size = jax.lax.psum(1, "t")
+        local_kv = h.n_kv // t_size
+        offset = jax.lax.axis_index("t") * local_kv
+        slopes = start * (start ** (jnp.arange(local_kv, dtype=jnp.float32) + offset))
+        return Alibi(slopes=slopes)
+
+    def apply(self, logits, L):
+        positions = jnp.arange(L, dtype=jnp.float32)
+        rel_pos = positions[:, None] - positions[None, :]  # [Qlen, Klen]
+        # logits shape: [B/d, Qlen, Klen, Q, K/t]
+        slopes = einops.rearrange(self.slopes, "K -> 1 1 1 K")  # [1, 1, 1, K]
+        position_bias = einops.rearrange(rel_pos, "Qlen Klen -> Qlen Klen 1 1")  # [Qlen, Klen, 1, 1]
+        bias = einops.rearrange(position_bias * slopes, "Qlen Klen 1 K -> 1 Qlen Klen 1 K")
+        return logits + bias
+
+
 @typechecked
 def rms_norm(x: bf16[b"batch/d len M"]) -> bf16[b"batch/d len M"]:
     mean2 = save_for_backward(jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True))
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
+
+
+def quiet_softmax(logits, axis):
+    """Softmax where a zero-valued logit competes, preventing attention from concentrating when all logits are negative."""
+    max_logits = jnp.maximum(jnp.max(logits, axis=axis, keepdims=True), 0.0)
+    stable = jnp.exp(logits - max_logits)
+    denominator = jnp.sum(stable, axis=axis, keepdims=True) + jnp.exp(-max_logits)
+    return stable / denominator
 
 
 @pytree_dataclass

@@ -206,6 +206,32 @@ Every training run gathers and reports performance information:
 * an rendered SVG of the optimized XLA computation graph. This is written into the model directory at `<model_dir>/training_step_optimized_hlo_<date>.svg`.
 
 
+## Experiment writeups
+
+Experiment writeups live in `docs/` as Quarto (`.qmd`) documents and are published to GitHub Pages from the `clankur/seqax` fork at https://clankur.github.io/seqax/. Renders run locally because they pull experiment data from `clearml_experiments/` (gitignored). To deploy after editing:
+
+```
+cd docs
+quarto publish gh-pages
+```
+
+This renders the site and force-pushes the result to the `gh-pages` branch on `origin` (clankur/seqax). The branch is kept off `main` since experiment writeups aren't merged into the codebase.
+
+First-time setup: bootstrap an empty `gh-pages` branch (Quarto will not create it for you), then enable Pages.
+
+```
+git worktree add --detach /tmp/ghp
+cd /tmp/ghp
+git checkout --orphan gh-pages
+git rm -rf .
+git commit --allow-empty -m "init gh-pages"
+git push -u origin gh-pages
+cd -
+git worktree remove /tmp/ghp
+```
+
+Then enable Pages at https://github.com/clankur/seqax/settings/pages (Source: Deploy from a branch · Branch: `gh-pages` · Folder: `/`).
+
 ## File formats
 
 We write checkpoints and datasets in simple file formats based on [zarr](https://zarr.dev/). See our file format specifications:

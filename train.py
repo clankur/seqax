@@ -3,6 +3,7 @@
 # Set XLA flags before importing JAX
 import init_seqax  # noqa: F401  # isort: skip
 
+import dataclasses
 import datetime
 import math
 import operator
@@ -47,6 +48,10 @@ class Hparams:
     d_ff: int
     rope_max_timescale: int
     use_flash_attention: bool = False
+    block_size: Optional[int] = None
+    n_e_layers: Optional[int] = None
+    n_t_layers: Optional[int] = None
+    reduction_strategy: str = "wei_sum"
 
 
 @pytree_dataclass
@@ -62,6 +67,9 @@ class TransformerLayer:
 
 
 Transformer = Array["layers", TransformerLayer]
+Encoder = Array["n_e_layers", TransformerLayer]
+ConceptDecoder = Array["layers", TransformerLayer]
+TokenDecoder = Array["n_t_layers", TransformerLayer]
 
 
 @pytree_dataclass
@@ -248,6 +256,388 @@ class Model:
 
 
 @pytree_dataclass
+class LCMModel:
+    embed: f32[b"vocab/t d_model/d"]
+    unembed: f32[b"vocab/t d_model/d"]
+    encoder: Encoder
+    concept_decoder: ConceptDecoder
+    token_decoder: TokenDecoder
+    final_layer_norm: f32[b"d_model/d/t"]
+    reduce_ln: f32[b"d_model/d/t"]
+    w_mix: f32[b"block_size 1"]
+    x_w_q: f32[b"n_t_layers d_model/d n_q_per_kv n_kv/t d_head"]
+    x_w_kv: f32[b"n_t_layers 2 d_model/d n_kv/t d_head"]
+    x_w_o: f32[b"n_t_layers d_model/d n_q_per_kv n_kv/t d_head"]
+    x_lnx: f32[b"n_t_layers d_model/t/d"]
+    x_lnz: f32[b"n_t_layers d_model/t/d"]
+
+    @staticmethod
+    @typechecked
+    def init(h: Hparams, rng: PRNGKey) -> "LCMModel":
+        embed = jax.random.normal(fold_in_str(rng, "embed"), (h.vocab, h.d_model), dtype=jnp.float32)
+        final_layer_norm = jnp.ones((h.d_model,), dtype=jnp.float32)
+        reduce_ln = jnp.ones((h.d_model,), dtype=jnp.float32)
+
+        truncated_normal_stddev = 0.87962566103423978
+        d_model_scale = 1 / (math.sqrt(h.d_model) * truncated_normal_stddev)
+
+        w_kv_scale = d_model_scale
+        w_q_scale = d_model_scale / math.sqrt(h.d_head)
+        total_head_dim = h.n_q_per_kv * h.n_kv * h.d_head
+        w_o_scale = 1 / (math.sqrt(total_head_dim) * truncated_normal_stddev)
+        w_up_scale = d_model_scale
+        w_down_scale = 1 / (math.sqrt(h.d_ff) * truncated_normal_stddev)
+        unembed_scale = d_model_scale
+
+        def make_transformer_layer(prefix, n_layers):
+            ln1 = jnp.ones((n_layers, h.d_model), dtype=jnp.float32)
+            ln2 = jnp.ones((n_layers, h.d_model), dtype=jnp.float32)
+            w_q_shape = (n_layers, h.d_model, h.n_q_per_kv, h.n_kv, h.d_head)
+            w_kv_shape = (n_layers, 2, h.d_model, h.n_kv, h.d_head)
+            ff_shape = (n_layers, h.d_model, h.d_ff)
+            w_q = w_q_scale * jax.random.truncated_normal(
+                fold_in_str(rng, f"{prefix}_w_q"), -2, 2, w_q_shape, dtype=jnp.float32
+            )
+            w_kv = w_kv_scale * jax.random.truncated_normal(
+                fold_in_str(rng, f"{prefix}_w_kv"), -2, 2, w_kv_shape, dtype=jnp.float32
+            )
+            w_o = w_o_scale * jax.random.truncated_normal(
+                fold_in_str(rng, f"{prefix}_w_o"), -2, 2, w_q_shape, dtype=jnp.float32
+            )
+            w_gate = w_up_scale * jax.random.truncated_normal(
+                fold_in_str(rng, f"{prefix}_w_gate"), -2, 2, ff_shape, dtype=jnp.float32
+            )
+            w_up = w_up_scale * jax.random.truncated_normal(
+                fold_in_str(rng, f"{prefix}_w_up"), -2, 2, ff_shape, dtype=jnp.float32
+            )
+            w_down = w_down_scale * jax.random.truncated_normal(
+                fold_in_str(rng, f"{prefix}_w_down"), -2, 2, ff_shape, dtype=jnp.float32
+            )
+            return TransformerLayer(
+                ln1=ln1, ln2=ln2, w_q=w_q, w_kv=w_kv, w_o=w_o, w_gate=w_gate, w_up=w_up, w_down=w_down
+            )
+
+        encoder = Encoder(
+            **{
+                f.name: getattr(make_transformer_layer("e", h.n_e_layers), f.name)
+                for f in dataclasses.fields(TransformerLayer)
+            }
+        )
+        concept_decoder = ConceptDecoder(
+            **{
+                f.name: getattr(make_transformer_layer("c", h.layers), f.name)
+                for f in dataclasses.fields(TransformerLayer)
+            }
+        )
+        token_decoder = TokenDecoder(
+            **{
+                f.name: getattr(make_transformer_layer("t", h.n_t_layers), f.name)
+                for f in dataclasses.fields(TransformerLayer)
+            }
+        )
+
+        x_w_q_shape = (h.n_t_layers, h.d_model, h.n_q_per_kv, h.n_kv, h.d_head)
+        x_w_kv_shape = (h.n_t_layers, 2, h.d_model, h.n_kv, h.d_head)
+        x_w_q = w_q_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "x_w_q"), -2, 2, x_w_q_shape, dtype=jnp.float32
+        )
+        x_w_kv = w_kv_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "x_w_kv"), -2, 2, x_w_kv_shape, dtype=jnp.float32
+        )
+        x_w_o = w_o_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "x_w_o"), -2, 2, x_w_q_shape, dtype=jnp.float32
+        )
+        x_lnx = jnp.ones((h.n_t_layers, h.d_model), dtype=jnp.float32)
+        x_lnz = jnp.ones((h.n_t_layers, h.d_model), dtype=jnp.float32)
+        w_mix = jnp.ones((h.block_size, 1), dtype=jnp.float32)
+
+        unembed = unembed_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "unembed"), -2, 2, (h.vocab, h.d_model), dtype=jnp.float32
+        )
+
+        arrays = LCMModel(
+            embed=embed,
+            unembed=unembed,
+            encoder=encoder,
+            concept_decoder=concept_decoder,
+            token_decoder=token_decoder,
+            final_layer_norm=final_layer_norm,
+            reduce_ln=reduce_ln,
+            w_mix=w_mix,
+            x_w_q=x_w_q,
+            x_w_kv=x_w_kv,
+            x_w_o=x_w_o,
+            x_lnx=x_lnx,
+            x_lnz=x_lnz,
+        )
+        shardings = make_shardings(LCMModel)
+        return jax.tree.map(lax.with_sharding_constraint, arrays, shardings)
+
+    @typechecked
+    def forward_pass(self, h: Hparams, ids: u32[b"B/d L"], is_seq_start: bool_[b"B/d L"]) -> f32[b"B/d L V/t"]:
+        embed = shardops.all_gather("V/t M/d -> V/t M", jnp.bfloat16(self.embed))
+        x = shardops.index_unreduced("[V/t] M, B/d L -> B/d L M", embed, ids)
+        embed_x = x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
+
+        B, L = ids.shape
+        n_blocks = L // h.block_size
+
+        segment_ids = jnp.cumsum(is_seq_start, axis=1)
+        segment_mask = segment_ids[:, :, None] == segment_ids[:, None, :]
+        segment_mask = segment_mask[..., jnp.newaxis, jnp.newaxis]
+
+        # Encoder mask: attend to previous blocks only (strict >, prevents future leakage)
+        chunk_indices = jnp.arange(L) // h.block_size
+        encoder_mask = chunk_indices[None, :, None] > chunk_indices[None, None, :]
+        encoder_mask = encoder_mask[..., jnp.newaxis, jnp.newaxis]
+        encoder_mask = jnp.logical_and(encoder_mask, segment_mask)
+
+        causal_mask = jnp.tril(jnp.ones((L, L), dtype=jnp.bool_))[None, ..., None, None]
+        causal_mask = jnp.logical_and(segment_mask, causal_mask)
+
+        concept_causal_mask = jnp.tril(jnp.ones((n_blocks, n_blocks), dtype=jnp.bool_))[None, ..., None, None]
+        concept_segment_ids = segment_ids[:, :: h.block_size]
+        concept_segment_mask = concept_segment_ids[:, :, None] == concept_segment_ids[:, None, :]
+        concept_segment_mask = concept_segment_mask[..., jnp.newaxis, jnp.newaxis]
+        concept_causal_mask = jnp.logical_and(concept_causal_mask, concept_segment_mask)
+
+        # Cross-attention mask: token attends to concept only if token's block > concept's block
+        q_pos = jnp.arange(L)
+        k_pos = jnp.arange(n_blocks)
+        x_causal_mask = (q_pos[:, None] // h.block_size) > k_pos[None, :]
+        x_causal_mask = x_causal_mask[None, ..., None, None]
+
+        rope_table = RopeTable.create(L, h)
+        concept_rope_table = RopeTable.create(n_blocks, h)
+
+        ##### Stage 1: Encoder
+        @explicit_activation_checkpointing
+        def encoder_body(x, layer_weights):
+            ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
+            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            nx = jnp.bfloat16(rms_norm(gx) * ln1)
+
+            w_q = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_q))
+            q = save_for_backward(shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q))
+            q = rope_table.apply("L D -> 1 L 1 1 D", q)
+            w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
+            k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv)
+            k = save_for_backward(k)
+            v = save_for_backward(v)
+            k = rope_table.apply("L d -> 1 L 1 d", k)
+            logits = shardops.einsum_unreduced(
+                "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t", q, k, preferred_element_type=jnp.float32
+            )
+            logits = jnp.where(encoder_mask, logits, -1e10)
+            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            attn_out = shardops.einsum_unreduced("B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v)
+            w_o = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
+            attn_out = shardops.einsum_unreduced("B/d Qlen Q K/t D, M Q K/t D -> B/d Qlen M", attn_out, w_o)
+            attn_out = shardops.psum_scatter("B/d Qlen M -> B/d Qlen M/t", attn_out)
+            x = save_for_backward(x + attn_out)
+
+            ln2 = save_for_backward(shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln2)))
+            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            nx = jnp.bfloat16(rms_norm(gx) * ln2)
+
+            w_gate = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_gate))
+            gate_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_gate))
+            w_up = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_up))
+            up_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_up))
+            y = jax.nn.swish(gate_proj) * up_proj
+            w_down = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_down))
+            ffn_out = shardops.einsum_unreduced("B/d L F/t, M F/t -> B/d L M", y, w_down)
+            ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
+
+            return jnp.bfloat16(x + ffn_out), ()
+
+        x, () = jax.lax.scan(encoder_body, jnp.bfloat16(x), self.encoder)
+
+        ##### Stage 2: Reduction
+        reduce_ln = shardops.all_gather("M/t/d -> M", jnp.float32(self.reduce_ln))
+        gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+        nx = jnp.bfloat16(rms_norm(gx) * reduce_ln)
+
+        nx_blocks = einops.rearrange(
+            nx, "B (n_blocks block_size) M -> B n_blocks block_size M", block_size=h.block_size
+        )
+        mix_weights = jax.nn.softmax(self.w_mix, axis=0)
+        z = jnp.sum(nx_blocks * mix_weights[None, None, :, :], axis=2)
+        z = shardops.psum_scatter("B/d n_blocks M -> B/d n_blocks M/t", z)
+
+        ##### Stage 3a: Concept Decoder
+        @explicit_activation_checkpointing
+        def concept_decoder_body(z, layer_weights):
+            ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
+            gz = shardops.all_gather("B/d n_blocks M/t -> B/d n_blocks M", z)
+            nz = jnp.bfloat16(rms_norm(gz) * ln1)
+
+            w_q = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_q))
+            q = save_for_backward(
+                shardops.einsum_unreduced("B/d n_blocks M, M Q K/t D -> B/d n_blocks Q K/t D", nz, w_q)
+            )
+            q = concept_rope_table.apply("n_blocks D -> 1 n_blocks 1 1 D", q)
+            w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
+            k, v = shardops.einsum_unreduced("B/d n_blocks M, k_v M K/t D -> k_v B/d n_blocks K/t D", nz, w_kv)
+            k = save_for_backward(k)
+            v = save_for_backward(v)
+            k = concept_rope_table.apply("n_blocks d -> 1 n_blocks 1 d", k)
+            logits = shardops.einsum_unreduced(
+                "B/d Qblocks Q K/t D, B/d Kblocks K/t D -> B/d Qblocks Kblocks Q K/t",
+                q,
+                k,
+                preferred_element_type=jnp.float32,
+            )
+            logits = jnp.where(concept_causal_mask, logits, -1e10)
+            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            attn_out = shardops.einsum_unreduced(
+                "B/d Qblocks Kblocks Q K/t, B/d Kblocks K/t D -> B/d Qblocks Q K/t D", probs, v
+            )
+            w_o = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
+            attn_out = shardops.einsum_unreduced("B/d Qblocks Q K/t D, M Q K/t D -> B/d Qblocks M", attn_out, w_o)
+            attn_out = shardops.psum_scatter("B/d Qblocks M -> B/d Qblocks M/t", attn_out)
+            z = save_for_backward(z + attn_out)
+
+            ln2 = save_for_backward(shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln2)))
+            gz = shardops.all_gather("B/d n_blocks M/t -> B/d n_blocks M", z)
+            nz = jnp.bfloat16(rms_norm(gz) * ln2)
+
+            w_gate = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_gate))
+            gate_proj = save_for_backward(
+                shardops.einsum_unreduced("B/d n_blocks M, M F/t -> B/d n_blocks F/t", nz, w_gate)
+            )
+            w_up = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_up))
+            up_proj = save_for_backward(
+                shardops.einsum_unreduced("B/d n_blocks M, M F/t -> B/d n_blocks F/t", nz, w_up)
+            )
+            y = jax.nn.swish(gate_proj) * up_proj
+            w_down = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_down))
+            ffn_out = shardops.einsum_unreduced("B/d n_blocks F/t, M F/t -> B/d n_blocks M", y, w_down)
+            ffn_out = shardops.psum_scatter("B/d n_blocks M -> B/d n_blocks M/t", ffn_out)
+
+            return jnp.bfloat16(z + ffn_out), ()
+
+        z, () = jax.lax.scan(concept_decoder_body, jnp.bfloat16(z), self.concept_decoder)
+
+        ##### Stage 3b: Token Decoder
+        @explicit_activation_checkpointing
+        def token_decoder_body(carry, scan_inputs):
+            x, z = carry
+            layer_weights, xwq, xwkv, xwo, xlnx, xlnz = scan_inputs
+
+            # Self-attention on x
+            ln1 = shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln1))
+            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            nx = jnp.bfloat16(rms_norm(gx) * ln1)
+
+            w_q = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_q))
+            q = save_for_backward(shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q))
+            q = rope_table.apply("L D -> 1 L 1 1 D", q)
+            w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
+            k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv)
+            k = save_for_backward(k)
+            v = save_for_backward(v)
+            k = rope_table.apply("L d -> 1 L 1 d", k)
+            logits = shardops.einsum_unreduced(
+                "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t", q, k, preferred_element_type=jnp.float32
+            )
+            logits = jnp.where(causal_mask, logits, -1e10)
+            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+            attn_out = shardops.einsum_unreduced("B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v)
+            w_o = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
+            attn_out = shardops.einsum_unreduced("B/d Qlen Q K/t D, M Q K/t D -> B/d Qlen M", attn_out, w_o)
+            attn_out = shardops.psum_scatter("B/d Qlen M -> B/d Qlen M/t", attn_out)
+            x = save_for_backward(x + attn_out)
+
+            # Cross-attention: Q from x, KV from z
+            xlnx_gathered = shardops.all_gather("M/t/d -> M", jnp.float32(xlnx))
+            xlnz_gathered = shardops.all_gather("M/t/d -> M", jnp.float32(xlnz))
+            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            nx_cross = jnp.bfloat16(rms_norm(gx) * xlnx_gathered)
+            gz = shardops.all_gather("B/d n_blocks M/t -> B/d n_blocks M", z)
+            nz_cross = jnp.bfloat16(rms_norm(gz) * xlnz_gathered)
+
+            xwq_gathered = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(xwq))
+            xq = save_for_backward(
+                shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx_cross, xwq_gathered)
+            )
+            xwkv_gathered = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(xwkv))
+            xk, xv = shardops.einsum_unreduced(
+                "B/d n_blocks M, k_v M K/t D -> k_v B/d n_blocks K/t D", nz_cross, xwkv_gathered
+            )
+            xk = save_for_backward(xk)
+            xv = save_for_backward(xv)
+
+            x_logits = shardops.einsum_unreduced(
+                "B/d L Q K/t D, B/d n_blocks K/t D -> B/d L n_blocks Q K/t",
+                xq,
+                xk,
+                preferred_element_type=jnp.float32,
+            )
+            x_logits = jnp.where(x_causal_mask, x_logits, -1e10)
+            x_probs = jnp.bfloat16(jax.nn.softmax(x_logits, axis=2))
+            x_attn_out = shardops.einsum_unreduced(
+                "B/d L n_blocks Q K/t, B/d n_blocks K/t D -> B/d L Q K/t D", x_probs, xv
+            )
+            xwo_gathered = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(xwo))
+            x_attn_out = shardops.einsum_unreduced("B/d L Q K/t D, M Q K/t D -> B/d L M", x_attn_out, xwo_gathered)
+            x_attn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", x_attn_out)
+            x = save_for_backward(x + x_attn_out)
+
+            # FFN
+            ln2 = save_for_backward(shardops.all_gather("M/t/d -> M", jnp.float32(layer_weights.ln2)))
+            gx = shardops.all_gather("B/d L M/t -> B/d L M", x)
+            nx = jnp.bfloat16(rms_norm(gx) * ln2)
+
+            w_gate = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_gate))
+            gate_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_gate))
+            w_up = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_up))
+            up_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_up))
+            y = jax.nn.swish(gate_proj) * up_proj
+            w_down = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_down))
+            ffn_out = shardops.einsum_unreduced("B/d L F/t, M F/t -> B/d L M", y, w_down)
+            ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
+
+            return (jnp.bfloat16(x + ffn_out), z), ()
+
+        (x, _), () = jax.lax.scan(
+            token_decoder_body,
+            (jnp.bfloat16(embed_x), jnp.bfloat16(z)),
+            (self.token_decoder, self.x_w_q, self.x_w_kv, self.x_w_o, self.x_lnx, self.x_lnz),
+        )
+
+        ##### Final layernorm and output projection
+        x = shardops.all_gather("B/d L M/t -> B/d L M", x)
+        ln = shardops.all_gather("M/t/d -> M", jnp.float32(self.final_layer_norm))
+        x = jnp.bfloat16(rms_norm(x) * ln)
+        unembed = shardops.all_gather("V/t M/d -> V/t M", jnp.bfloat16(self.unembed))
+        logits = shardops.einsum_unreduced(
+            "B/d L M, V/t M -> B/d L V/t", x, unembed, preferred_element_type=jnp.float32
+        )
+
+        return logits
+
+    @typechecked
+    def loss(self, h: Hparams, batch: TokenBatch) -> f32[b""]:
+        inputs = jnp.pad(batch.targets[:, :-1], pad_width=((0, 0), (1, 0)))
+        is_seq_start: bool_[b"batch/d len"] = batch.is_seq_start
+        inputs: u32[b"batch/d len"] = jnp.where(is_seq_start, 0, inputs)
+
+        logits: f32[b"batch/d len V/t"] = self.forward_pass(h, inputs, is_seq_start)
+        max_logits: f32[b"batch/d len 1"] = lax.pmax(jnp.max(lax.stop_gradient(logits), axis=-1, keepdims=True), "t")
+        logits = logits - max_logits
+        sum_logits = lax.psum(jnp.sum(jnp.exp(logits), axis=-1, keepdims=True), "t")
+        logsumexp = jnp.log(sum_logits)
+        logprobs: f32[b"batch/d len V/t"] = logits - logsumexp
+        logprobs_at_targets = shardops.index_unreduced(
+            "batch/d len [V/t], batch/d len -> batch/d len", logprobs, batch.targets
+        )
+        logprobs_at_targets = shardops.psum_scatter("batch/d len -> batch/d len/t", logprobs_at_targets)
+        tokens_in_global_batch = logprobs_at_targets.size * jax.lax.psum(1, ("d", "t"))
+        return -jnp.sum(logprobs_at_targets) / jnp.float32(tokens_in_global_batch)
+
+
+@pytree_dataclass
 class RopeTable:
     sin: f32[b"len d_head2"]
     cos: f32[b"len d_head2"]
@@ -274,8 +664,7 @@ class RopeTable:
         return jnp.append(r1, r2, axis=-1)
 
 
-@typechecked
-def rms_norm(x: bf16[b"batch/d len M"]) -> bf16[b"batch/d len M"]:
+def rms_norm(x):
     mean2 = save_for_backward(jnp.mean(jax.lax.square(jnp.float32(x)), axis=-1, keepdims=True))
     return jnp.bfloat16(x * jax.lax.rsqrt(mean2 + 1e-6))
 
@@ -411,6 +800,90 @@ def training_step(
     return sharded_step(state, step, batch)
 
 
+@pytree_dataclass
+class LCMState:
+    weights: LCMModel
+    adam_mu: LCMModel
+    adam_nu: LCMModel
+
+    @staticmethod
+    def init(hparams: Hparams, rng: PRNGKey) -> "LCMState":
+        weights = LCMModel.init(hparams, rng)
+        adam_mu = jax.tree.map(lambda p: p * 0.0, weights)
+        adam_nu = jax.tree.map(lambda p: p * 0.0, weights)
+        return LCMState(weights=weights, adam_mu=adam_mu, adam_nu=adam_nu)
+
+
+@partial(jax.jit, static_argnums=(2, 3), donate_argnums=(0,))
+def lcm_training_step(
+    state: LCMState, step: u32[b""], h: Hparams, hparams: TrainingHparams, batch: TokenBatch
+) -> Tuple[Any, Metrics]:
+    @partial(shardtypes.typed_shard_map, check_rep=False)
+    def sharded_step(state: LCMState, step: u32[b""], batch: TokenBatch) -> Tuple[LCMState, Metrics]:
+        loss, grad = jax.value_and_grad(lambda weights: weights.loss(h, batch))(state.weights)
+        loss = jax.lax.psum(loss, ("d", "t"))
+
+        warmup_lr = (jnp.float32(step) / jnp.float32(hparams.warmup_steps)) * hparams.learning_rate
+        cosine = jnp.cos(
+            jnp.pi
+            * (jnp.float32(step - hparams.warmup_steps) / jnp.float32(hparams.steps_for_lr - hparams.warmup_steps))
+        )
+        cosine_lr = hparams.learning_rate * (
+            hparams.cosine_learning_rate_final_fraction
+            + (1 - hparams.cosine_learning_rate_final_fraction) * (cosine * 0.5 + 0.5)
+        )
+        lr = jnp.where(step < hparams.warmup_steps, warmup_lr, cosine_lr)
+
+        grad_leaves, grad_treedef = jax.tree_util.tree_flatten(grad)
+        global_norm_square = jnp.float32(0.0)
+        for g in grad_leaves:
+            assert g.dtype == jnp.float32
+            global_norm_square += jnp.sum(jax.lax.square(g))
+        global_norm_square = jax.lax.psum(global_norm_square, ("d", "t"))
+        global_norm = jnp.sqrt(global_norm_square)
+        rescale = jnp.minimum(1.0, 1.0 / global_norm)
+
+        new_ps = []
+        new_mus = []
+        new_nus = []
+        for p, g, mu, nu, spec in zip(
+            tree_leaves(state.weights),
+            grad_leaves,
+            tree_leaves(state.adam_mu),
+            tree_leaves(state.adam_nu),
+            tree_leaves(shardtypes.make_partition_specs(LCMState)),
+        ):
+            # w_mix is intentionally replicated (tiny parameter), so we skip the fully-sharded check
+            g = g * rescale
+            mu = (1 - hparams.adam_b1) * g + hparams.adam_b1 * mu
+            nu = (1 - hparams.adam_b2) * jax.lax.square(g) + hparams.adam_b2 * nu
+            completed_steps = step + 1
+            mu_hat = mu / (1 - jnp.float32(hparams.adam_b1) ** completed_steps)
+            nu_hat = nu / (1 - jnp.float32(hparams.adam_b2) ** completed_steps)
+            g = mu_hat / (jnp.sqrt(nu_hat + hparams.adam_eps_root) + hparams.adam_eps)
+            g += hparams.weight_decay * p
+            g *= lr
+
+            new_ps.append(p - g)
+            new_mus.append(mu)
+            new_nus.append(nu)
+
+        new_state = LCMState(
+            weights=jax.tree_util.tree_unflatten(grad_treedef, new_ps),
+            adam_mu=jax.tree_util.tree_unflatten(grad_treedef, new_mus),
+            adam_nu=jax.tree_util.tree_unflatten(grad_treedef, new_nus),
+        )
+        metrics = Metrics(
+            loss=loss,
+            learning_rate=lr,
+            grad_norm=global_norm * rescale,
+            raw_grad_norm=global_norm,
+        )
+        return new_state, metrics
+
+    return sharded_step(state, step, batch)
+
+
 @dataclass(frozen=True)
 class Paths:
     root_working_dir: str
@@ -465,14 +938,20 @@ def main_contained(config, logger, wandb_run=None):
 
         model_dir = os.path.join(config.paths.root_working_dir, config.paths.model_name)
         training_io.mkdir(model_dir)
-        state = jax.jit(partial(State.init, config.model))(fold_in_str(root_rng, "init"))
-        state, start_step = training_io.load_checkpoint_if_it_exists(model_dir, state, config.io)
 
-        # Explicitly compile training step, to record XLA HLO graph.
-        # See https://bnikolic.co.uk/blog/python/jax/2022/02/22/jax-outputgraph-rev
-        c_training_step = training_step.lower(
-            state, jnp.uint32(0), config.model, config.training, loader.load(0)
-        ).compile()
+        if config.model.block_size is not None:
+            state = jax.jit(partial(LCMState.init, config.model))(fold_in_str(root_rng, "init"))
+            state, start_step = training_io.load_checkpoint_if_it_exists(model_dir, state, config.io)
+            c_training_step = lcm_training_step.lower(
+                state, jnp.uint32(0), config.model, config.training, loader.load(0)
+            ).compile()
+        else:
+            state = jax.jit(partial(State.init, config.model))(fold_in_str(root_rng, "init"))
+            state, start_step = training_io.load_checkpoint_if_it_exists(model_dir, state, config.io)
+            c_training_step = training_step.lower(
+                state, jnp.uint32(0), config.model, config.training, loader.load(0)
+            ).compile()
+
         date = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         training_io.save_hlo_svg(os.path.join(model_dir, f"training_step_optimized_hlo_{date}.svg"), c_training_step)
 

@@ -1,0 +1,15 @@
+# Command: XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train --config-name=local_test_synthetic_lcm +paths.model_name=lcm_test
+defaults:
+- local_test_synthetic
+- _self_
+
+model:
+  block_size: 8
+  n_e_layers: 1
+  layers: 1
+  n_t_layers: 1
+  reduction_strategy: "wei_sum"
+
+training:
+  tokens:
+    len: 64

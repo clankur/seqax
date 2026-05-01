@@ -75,10 +75,14 @@ TRACKED_FIELDS = [
     ("d_model", "d_model"),
     ("d_ff", "d_ff"),
 ]
+# `model.layers` means concept decoder depth in LCM rows and total transformer
+# depth in baseline rows; route it to a different display column per kind.
+DISPLAY_KEY_OVERRIDES = {"baseline": {"layers": "Transformer_Layers"}}
 
-# Defaults for LCM runs that didn't override these fields (from configs/slim_v4-8_31m.yaml,
-# which inherits from configs/slim_base.yaml).
-LCM_CONFIG_DEFAULTS = {
+# Defaults for runs that didn't override these fields. The baseline
+# (configs/slim_v4-32_31m.yaml) and the LCM runs (configs/slim_v4-8_31m.yaml)
+# inherit the same model section from configs/slim_base.yaml.
+SHARED_DEFAULTS = {
     "d_model": 256,
     "d_ff": 1024,
     "n_kv": 16,
@@ -217,11 +221,12 @@ def get_eval_metrics_table(metrics_data, config_data, top_k=None):
         cfg = config_data[guid]
         for config_key, display_key in TRACKED_FIELDS:
             val = cfg.get(config_key)
-            if val is None and d["kind"] in ("lcm", "leaky"):
-                val = LCM_CONFIG_DEFAULTS.get(config_key)
+            if val is None:
+                val = SHARED_DEFAULTS.get(config_key)
             if val is None:
                 continue
-            fields[display_key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
+            key = DISPLAY_KEY_OVERRIDES.get(d["kind"], {}).get(config_key, display_key)
+            fields[key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
         name = d["name"]
         rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Eval Loss": float(d["final_loss"]), **fields})
     df = pd.DataFrame(rows).sort_values("Eval Loss").reset_index(drop=True)

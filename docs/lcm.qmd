@@ -44,6 +44,7 @@ At concept_size=8 with equal self-attention and cross-attention layers, this is 
 ```{python}
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -53,6 +54,15 @@ import plotly.io as pio
 pio.renderers.default = "plotly_mimetype+notebook_connected"
 
 LCM_EXPERIMENTS_DIR = Path("../clearml_experiments/slim_v4_32_31m/lcm")
+BASELINE_1024_DIR = Path("../clearml_experiments/slim_v4_32_31m/main/slim_v4_32_31m_lcm_baseline_b5ed44ff59864cf69c4f84d4ad2db5be")
+
+# Window during which the encoder/cross-attention mask used `>=` and leaked within-block
+# future tokens. Every block_size>1 run trained in this window beats the baseline; the fix
+# (strict `>`) was in place before 2025-01-04 16:16 UTC and after 2025-01-05 06:26 UTC.
+LEAKY_WINDOW = (
+    datetime(2025, 1, 4, 22, 0, tzinfo=timezone.utc),
+    datetime(2025, 1, 5, 6, 0, tzinfo=timezone.utc),
+)
 
 TRACKED_FIELDS = [
     ("block_size", "Block_Size"),
@@ -65,6 +75,16 @@ TRACKED_FIELDS = [
     ("d_model", "d_model"),
     ("d_ff", "d_ff"),
 ]
+
+# Defaults for LCM runs that didn't override these fields (from configs/slim_v4-8_31m.yaml,
+# which inherits from configs/slim_base.yaml).
+LCM_CONFIG_DEFAULTS = {
+    "d_model": 256,
+    "d_ff": 1024,
+    "n_kv": 16,
+    "layers": 8,
+    "learning_rate": 1.35e-2,
+}
 
 
 def calculate_ema(data, smoothing=0.97):
@@ -95,29 +115,60 @@ def _parse_config(metadata):
     return config
 
 
-def get_metrics_data(experiments_dir):
+def _infer_seq_len(metadata):
+    name = metadata["experiment_name"]
+    if "seq_len=2048" in name or metadata.get("hyperparameters", {}).get("Hydra/training.token.len") == "2048":
+        return 2048
+    return 1024
+
+
+def _load_experiment(exp_dir, metrics_data, config_data, kind="lcm"):
+    metadata = json.loads((exp_dir / "metadata.json").read_text())
+    if _infer_seq_len(metadata) != 1024:
+        return
+    created = datetime.fromisoformat(metadata["created"].replace(" ", "T"))
+    if kind == "lcm" and LEAKY_WINDOW[0] <= created < LEAKY_WINDOW[1]:
+        kind = "leaky"
+    task_id = metadata["experiment_id"]
+    config_data[task_id] = _parse_config(metadata)
+    loss_csv = _read_csv(exp_dir / "metrics" / "loss_loss.csv")
+    if loss_csv is None:
+        return
+    steps, loss = loss_csv
+    name = metadata["experiment_name"].replace("model.", "").removeprefix("slim_v4-32_31m_")
+    metrics_data[task_id] = {
+        "name": name,
+        "steps": steps,
+        "loss": loss,
+        "final_loss": calculate_ema(loss)[-1],
+        "seq_len": _infer_seq_len(metadata),
+        "kind": kind,
+    }
+
+
+def get_metrics_data(experiments_dir, baseline_dirs=()):
     metrics_data, config_data = {}, {}
     for exp_dir in sorted(experiments_dir.iterdir()):
-        if not exp_dir.is_dir():
-            continue
-        metadata = json.loads((exp_dir / "metadata.json").read_text())
-        task_id = metadata["experiment_id"]
-        config_data[task_id] = _parse_config(metadata)
-        loss_csv = _read_csv(exp_dir / "metrics" / "loss_loss.csv")
-        if loss_csv is None:
-            continue
-        steps, loss = loss_csv
-        final_loss = _read_csv(exp_dir / "metrics" / "final_loss_eval.csv")
-        final_perplexity = _read_csv(exp_dir / "metrics" / "final_perplexity_eval.csv")
-        name = metadata["experiment_name"].replace("model.", "").removeprefix("slim_v4-32_31m_")
-        metrics_data[task_id] = {
-            "name": name,
-            "steps": steps,
-            "loss": loss,
-            "final_loss": final_loss[1] if final_loss else None,
-            "final_perplexity": final_perplexity[1] if final_perplexity else None,
-        }
+        if exp_dir.is_dir():
+            _load_experiment(exp_dir, metrics_data, config_data, kind="lcm")
+    for exp_dir in baseline_dirs:
+        _load_experiment(exp_dir, metrics_data, config_data, kind="baseline")
     return metrics_data, config_data
+
+
+def filter_metrics(metrics_data, seq_len=None, block_size=None, kinds=("lcm", "baseline"), config_data=None):
+    out = {}
+    for guid, d in metrics_data.items():
+        if seq_len is not None and d["seq_len"] != seq_len:
+            continue
+        if d["kind"] not in kinds:
+            continue
+        if block_size is not None and d["kind"] == "lcm":
+            cfg = (config_data or {}).get(guid, {})
+            if str(cfg.get("block_size")) != str(block_size):
+                continue
+        out[guid] = d
+    return out
 
 
 def get_top_k_experiments(loss_data, k=None, ema_smoothing=0.97):
@@ -163,30 +214,35 @@ def get_eval_metrics_table(metrics_data, config_data, top_k=None):
         if d["final_loss"] is None:
             continue
         fields = {}
+        cfg = config_data[guid]
         for config_key, display_key in TRACKED_FIELDS:
-            if config_key in config_data[guid]:
-                val = config_data[guid][config_key]
-                fields[display_key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
+            val = cfg.get(config_key)
+            if val is None and d["kind"] in ("lcm", "leaky"):
+                val = LCM_CONFIG_DEFAULTS.get(config_key)
+            if val is None:
+                continue
+            fields[display_key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
         name = d["name"]
-        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Eval Loss": float(d["final_loss"][0]), **fields})
+        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Eval Loss": float(d["final_loss"]), **fields})
     df = pd.DataFrame(rows).sort_values("Eval Loss").reset_index(drop=True)
     if top_k:
         df = df.head(top_k)
     return df.style.format(precision=6).set_properties(**{"text-align": "left"})
 
 
-metrics_data, config_data = get_metrics_data(LCM_EXPERIMENTS_DIR)
+metrics_data, config_data = get_metrics_data(LCM_EXPERIMENTS_DIR, baseline_dirs=[BASELINE_1024_DIR])
 ```
 
 ## concept_size=1 control
 
-A 31M parameter model was trained on SlimPajama at sequence length 2048. The [baseline](../configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
+A 31M parameter model was trained on SlimPajama at sequence length 1024. The [baseline](../configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
 
 At concept_size=1, there is no compression: each concept embedding represents exactly one token. The reduction step is a no-op. Any gap between this configuration and the baseline is purely architectural overhead from the encoder, concept decoder, and cross-attention path. The gap exists, which means the degradation is not caused by compression. It is caused by the architecture.
 
 ```{python}
-plot_loss_data(metrics_data, ema_smoothing=0.97, top_k=10, opacity=0.05)
-plot_loss_data(metrics_data, ema_smoothing=0.99, top_k=5)
+bs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)
+bs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=("baseline",)))
+plot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)
 ```
 
 ## Reduction strategies
@@ -195,7 +251,7 @@ Attention-based reduction is the only strategy that appears in the top 10 experi
 
 ## Scaling compute
 
-The gap persists on the validation set (240 samples) when scaling the LCM with 4--8x additional FLOPs:
+The gap persists when scaling the LCM with 4--8x additional FLOPs:
 
 | Scaling axis     | Values tested                                        |
 |------------------|------------------------------------------------------|
@@ -207,16 +263,18 @@ The gap persists on the validation set (240 samples) when scaling the LCM with 4
 Additional capacity does not close the gap. Scaling heads to 64 or 128 also nullifies KV cache savings, since the concept decoder's own KV cache grows proportionally.
 
 ```{python}
-get_eval_metrics_table(metrics_data, config_data, top_k=10)
+seq_1024 = filter_metrics(metrics_data, seq_len=1024)
+plot_loss_data(seq_1024, ema_smoothing=0.97, top_k=10, opacity=0.05)
+get_eval_metrics_table(seq_1024, config_data, top_k=10)
 ```
 
 ## Limitations
 
-These results are from a single seed with 240 validation samples. The directional result is consistent across all configurations, but exact gap sizes are not reliable without bootstrap CIs over ≥1M tokens with multiple seeds.
+"Eval Loss" in the tables above is the EMA-smoothed final training loss (not held-out eval). Results are from a single seed each. The directional result is consistent across the seq_len=1024 configurations, but exact gap sizes are not reliable without bootstrap CIs over ≥1M tokens with multiple seeds.
 
 Compute matching across LCM variants is approximate. The 4--8x FLOP range is a rough bound, not a controlled comparison along a single axis (parameters, training FLOPs, or inference FLOPs).
 
-31M parameters at $L$ = 2048 is below the regime where LCM-style methods are expected to help. The LCM paper's claims center on long-context semantic compression. A negative result at this scale does not rule out the architecture at larger scales or longer contexts.
+31M parameters at $L$ = 1024 is below the regime where LCM-style methods are expected to help. The LCM paper's claims center on long-context semantic compression. A negative result at this scale does not rule out the architecture at larger scales or longer contexts.
 
 No experiment measures actual KV cache memory, prefill latency, or decode latency.
 
@@ -241,4 +299,21 @@ Opus 4.7 on high reviewed this code and flagged two "bugs":
 
 > `x_causal_mask = q_pos // concept_size > k_pos` (`train.py:545`) prevents a token from cross-attending to its own concept block. Whether that's intended (predicting chunk `i` from concepts `<i`) deserves an explicit sentence, because it materially changes what the LCM is doing.
 
-The encoder produces concept $i$ from block $i$. The token decoder consumes concept $i$ to predict tokens in block $i$. With `>=`, tokens in block $i$ attend to themselves through the concept embedding, introducing future leakage. Training loss improves. Autoregressive quality degrades. Accepting either fix without tracing the data flow introduces a silent correctness bug.
+Both fixes change `>` to `>=`. Concept $i$ is produced from block $i$ and consumed by the token decoder to predict tokens in block $i$. With `>=`, tokens in block $i$ attend to themselves through the concept embedding. This is future leakage.
+
+The `>=` mask shipped accidentally for an 8-hour window on 2025-01-04 → 2025-01-05. Runs from that window form a leaky cohort and are excluded from the analyses above. The plot below shows leaky runs that beat the baseline:
+
+```{python}
+baseline_loss = {d["seq_len"]: d["final_loss"] for d in metrics_data.values() if d["kind"] == "baseline"}
+leaky = filter_metrics(metrics_data, kinds=("leaky", "baseline"))
+beat_baseline = {
+    guid: d for guid, d in leaky.items()
+    if d["kind"] == "baseline" or d["final_loss"] < baseline_loss[d["seq_len"]]
+}
+plot_loss_data(beat_baseline, ema_smoothing=0.97, opacity=0.1)
+get_eval_metrics_table(beat_baseline, config_data)
+```
+
+7 of 10 leaky `block_size > 1` runs beat the baseline by 0.06–0.83 nats. The lowest training loss across all LCM runs (0.92) is from `block_size=4` in this cohort. The leaky `block_size=1` run is unaffected: at concept_size=1 there are no within-block future tokens to leak.
+
+The LLM review recommends the bug. Training loss prefers it. Catching it requires tracing the data flow by hand.

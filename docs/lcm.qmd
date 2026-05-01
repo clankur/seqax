@@ -298,7 +298,7 @@ Other experiments in rough priority order: disable sequence packing to rule out 
 
 ## Appendix: LLM code review failure
 
-Opus 4.7 on high reviewed this code and flagged two "bugs":
+Opus 4.7 on high reviewed this code and proposed two changes:
 
 > `encoder_mask = chunk_indices[:, None] > chunk_indices[None, :]` (`train.py:538`) is a strict inequality. A token cannot attend to itself or to other tokens in its own chunk, so the encoder cannot mix tokens within a block — exactly the operation the encoder is supposed to do. This almost certainly should be `>=`.
 
@@ -306,7 +306,7 @@ Opus 4.7 on high reviewed this code and flagged two "bugs":
 
 Both fixes change `>` to `>=`. Concept $i$ is produced from block $i$ and consumed by the token decoder to predict tokens in block $i$. With `>=`, tokens in block $i$ attend to themselves through the concept embedding. This is future leakage.
 
-The `>=` mask shipped accidentally for an 8-hour window on 2025-01-04 → 2025-01-05. Runs from that window form a leaky cohort and are excluded from the analyses above. The plot below shows leaky runs that beat the baseline:
+The `>=` mask had been shipped and reverted once before, in an 8-hour window on 2025-01-04 → 2025-01-05. Opus's review re-proposed it. The proposal was rejected; the prior bug was recognized in review. The cohort below is from that window, excluded from the analyses above:
 
 ```{python}
 baseline_loss = {d["seq_len"]: d["final_loss"] for d in metrics_data.values() if d["kind"] == "baseline"}
@@ -320,5 +320,3 @@ get_eval_metrics_table(beat_baseline, config_data)
 ```
 
 7 of 10 leaky `block_size > 1` runs beat the baseline by 0.06–0.83 nats. The lowest training loss across all LCM runs (0.92) is from `block_size=4` in this cohort. The leaky `block_size=1` run is unaffected: at concept_size=1 there are no within-block future tokens to leak.
-
-The LLM review recommends the bug. Training loss prefers it. Catching it requires tracing the data flow by hand.

@@ -23,7 +23,7 @@ Four reduction strategies were tested for collapsing tokens within a block:
 | Learned weighted sum | Learnable scalar weight per position within the block |
 | Attention | Learnable query attends over block tokens |
 
-Implementation: [`forward_pass`](../train.py#L370), [`encoder_block`](../train.py#L414), [`concept_decoder_block`](../train.py#L470), [`token_decoder_block`](../train.py#L530).
+Implementation: [`forward_pass`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L377), [`encoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L415), [`concept_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L470), [`token_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L524).
 
 ### Divergences from the LCM paper
 
@@ -240,7 +240,7 @@ metrics_data, config_data = get_metrics_data(LCM_EXPERIMENTS_DIR, baseline_dirs=
 
 ## concept_size=1 control
 
-A 31M parameter model was trained on SlimPajama at sequence length 1024. The [baseline](../configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
+A 31M parameter model was trained on SlimPajama at sequence length 1024. The [baseline](https://github.com/clankur/seqax/blob/feat/lcm/configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
 
 At concept_size=1, there is no compression: each concept embedding represents exactly one token. The reduction step is a no-op. Any gap between this configuration and the baseline is purely architectural overhead from the encoder, concept decoder, and cross-attention path. The gap exists, which means the degradation is not caused by compression. It is caused by the architecture.
 
@@ -304,7 +304,7 @@ Opus 4.7 on high reviewed this code and proposed two changes:
 
 > `x_causal_mask = q_pos // concept_size > k_pos` (`train.py:545`) prevents a token from cross-attending to its own concept block. Whether that's intended (predicting chunk `i` from concepts `<i`) deserves an explicit sentence, because it materially changes what the LCM is doing.
 
-Both fixes change `>` to `>=`. Concept $i$ is produced from block $i$ and consumed by the token decoder to predict tokens in block $i$. With `>=`, tokens in block $i$ attend to themselves through the concept embedding. This is future leakage.
+The encoder produces concept $i$ from block $i$. The token decoder consumes concept $i$ to predict tokens in block $i$. With `>=`, tokens in block $i$ attend to themselves through the concept embedding, introducing future leakage. 
 
 The `>=` mask had been shipped and reverted once before, in an 8-hour window on 2025-01-04 → 2025-01-05. Opus's review re-proposed it. The proposal was rejected; the prior bug was recognized in review. The cohort below is from that window, excluded from the analyses above:
 

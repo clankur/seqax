@@ -295,28 +295,3 @@ The concept_size=1 result narrows the problem to the architecture but does not i
 | Initialize encoder/decoder from trained baseline | Joint training vs. architecture |
 
 Other experiments in rough priority order: disable sequence packing to rule out concept boundary corruption from packed documents; increase context length to $L$ = 4096 where the LCM thesis applies; measure actual KV cache memory and latency to plot the loss-vs-KV-bytes Pareto frontier; add an auxiliary chunk-reconstruction loss to force concept embeddings to be informative.
-
-## Appendix: LLM code review failure
-
-Opus 4.7 on high reviewed this code and proposed two changes:
-
-> `encoder_mask = chunk_indices[:, None] > chunk_indices[None, :]` (`train.py:538`) is a strict inequality. A token cannot attend to itself or to other tokens in its own chunk, so the encoder cannot mix tokens within a block — exactly the operation the encoder is supposed to do. This almost certainly should be `>=`.
-
-> `x_causal_mask = q_pos // concept_size > k_pos` (`train.py:545`) prevents a token from cross-attending to its own concept block. Whether that's intended (predicting chunk `i` from concepts `<i`) deserves an explicit sentence, because it materially changes what the LCM is doing.
-
-The encoder produces concept $i$ from block $i$. The token decoder consumes concept $i$ to predict tokens in block $i$. With `>=`, tokens in block $i$ attend to themselves through the concept embedding, introducing future leakage. 
-
-The `>=` mask had been shipped and reverted once before, in an 8-hour window on 2025-01-04 → 2025-01-05. Opus's review re-proposed it. The proposal was rejected; the prior bug was recognized in review. The cohort below is from that window, excluded from the analyses above:
-
-```{python}
-baseline_loss = {d["seq_len"]: d["final_loss"] for d in metrics_data.values() if d["kind"] == "baseline"}
-leaky = filter_metrics(metrics_data, kinds=("leaky", "baseline"))
-beat_baseline = {
-    guid: d for guid, d in leaky.items()
-    if d["kind"] == "baseline" or d["final_loss"] < baseline_loss[d["seq_len"]]
-}
-plot_loss_data(beat_baseline, ema_smoothing=0.97, opacity=0.1)
-get_eval_metrics_table(beat_baseline, config_data)
-```
-
-7 of 10 leaky `block_size > 1` runs beat the baseline by 0.06–0.83 nats. The lowest training loss across all LCM runs (0.92) is from `block_size=4` in this cohort. The leaky `block_size=1` run is unaffected: at concept_size=1 there are no within-block future tokens to leak.

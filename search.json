@@ -53,7 +53,7 @@
     "href": "lcm.html#compression-strategies",
     "title": "Jointly-trained LCM for KV cache compression",
     "section": "Compression strategies",
-    "text": "Compression strategies\nFour compression strategies were tested for collapsing tokens within a block:\n\n\n\n\n\n\n\n\nStrategy\nFormula\nDescription\n\n\n\n\nSum\n\\(c = \\sum_{i=1}^{k} x_i\\)\nElement-wise sum of token representations\n\n\nMax\n\\(c_j = \\max_i\\, x_{i,j}\\)\nElement-wise max over token representations\n\n\nLearned weighted sum\n\\(c = \\sum_{i=1}^{k} w_i x_i,\\quad w \\in \\mathbb{R}^k\\) learnable\nLearnable scalar weight per position within the block\n\n\nAttention\n\\(c = \\mathrm{softmax}\\!\\left(\\tfrac{q^\\top (XW_K)^\\top}{\\sqrt{d}}\\right)\\!(XW_V)W_O\\)\nConstant learned query \\(q\\) attends over projected block tokens\n\n\n\nImplementation: forward_pass, encoder_body, concept_decoder_body, token_decoder_body.\nAttention-based compression is the only strategy that appears in the top 10 experiments. Sum, max, and learned weighted sum do not. This is expected: attention-based compression is the closest to a standard transformer layer."
+    "text": "Compression strategies\nFour compression strategies were tested for collapsing tokens within a block:\n\n\n\n\n\n\n\n\nStrategy\nFormula\nDescription\n\n\n\n\nSum\n\\(c = \\sum_{i=1}^{k} x_i\\)\nElement-wise sum of token representations\n\n\nMax\n\\(c_j = \\max_i\\, x_{i,j}\\)\nElement-wise max over token representations\n\n\nLearned weighted sum\n\\(c = \\sum_{i=1}^{k} w_i x_i,\\quad w \\in \\mathbb{R}^k\\) learnable\nLearnable scalar weight per position within the block\n\n\nAttention\n\\(c = \\mathrm{softmax}\\!\\left(\\tfrac{q^\\top (XW_K)^\\top}{\\sqrt{d}}\\right)\\!(XW_V)W_O\\)\nConstant learned query \\(q\\) attends over projected block tokens\n\n\n\nImplementation: forward_pass, encoder_body, concept_decoder_body, token_decoder_body."
   },
   {
     "objectID": "lcm.html#what-is-actually-compressed",
@@ -68,6 +68,13 @@
     "title": "Jointly-trained LCM for KV cache compression",
     "section": "concept_size=1 control",
     "text": "concept_size=1 control\nA 31M parameter model was trained on SlimPajama at sequence length 1024. The baseline without any concept architecture outperforms every LCM variant across the full training run.\nAt concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is not caused by compression but the architecture.\n\n\nCode\nbs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)\nbs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=(\"baseline\",)))\nplot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)"
+  },
+  {
+    "objectID": "lcm.html#impact-of-compression-strategies",
+    "href": "lcm.html#impact-of-compression-strategies",
+    "title": "Jointly-trained LCM for KV cache compression",
+    "section": "Impact of compression strategies",
+    "text": "Impact of compression strategies\nAttention-based compression is the only strategy that appears in the top 10 experiments. Parameter counts for the reduction step at the 31M config (\\(d_\\text{model}=256\\), \\(n_{kv}=16\\), \\(d_\\text{head}=64\\), \\(n_{q/kv}=1\\)):\n\n\n\nStrategy\nadditional parameters\n\n\n\n\nSum\n0\n\n\nMax\n0\n\n\nLearned weighted sum\nblock_size\n\n\nAttention (\\(W_K\\)/\\(W_V\\) + \\(W_O\\) + \\(q\\))\n787K"
   },
   {
     "objectID": "lcm.html#scaling-compute",

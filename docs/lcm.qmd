@@ -8,7 +8,7 @@ Meta's [Large Concept Models](https://arxiv.org/pdf/2412.08821) replace next-tok
 
 The three stages are:
 
-1.  **Encoder.** Tokens attend to tokens in previous blocks via causal block masking, then a reduction operation collapses each block of $k$ tokens into a single concept embedding.
+1.  **Encoder.** Tokens attend to all tokens in the same block and all previous blocks ($\leq i$), then a reduction operation collapses each block of $k$ tokens into a single concept embedding.
 2.  **Concept decoder.** Standard causal transformer over the sequence of concept embeddings.
 3.  **Token decoder.** Causal self-attention over tokens, plus cross-attention to concept embeddings from blocks $< i$.
 

@@ -401,9 +401,9 @@ class LCMModel:
         segment_mask = segment_ids[:, :, None] == segment_ids[:, None, :]
         segment_mask = segment_mask[..., jnp.newaxis, jnp.newaxis]
 
-        # Encoder mask: attend to previous blocks only (strict >, prevents future leakage)
+        # Encoder mask: tokens attend to own block and all previous blocks
         chunk_indices = jnp.arange(L) // h.block_size
-        encoder_mask = chunk_indices[None, :, None] > chunk_indices[None, None, :]
+        encoder_mask = chunk_indices[None, :, None] >= chunk_indices[None, None, :]
         encoder_mask = encoder_mask[..., jnp.newaxis, jnp.newaxis]
         encoder_mask = jnp.logical_and(encoder_mask, segment_mask)
 

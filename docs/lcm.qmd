@@ -27,8 +27,6 @@ Four compression strategies were tested for collapsing tokens within a block:
 
 Implementation: [`forward_pass`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L377), [`encoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L415), [`concept_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L470), [`token_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L524).
 
-Attention-based compression is the only strategy that appears in the top 10 experiments. Sum, max, and learned weighted sum do not. This is expected: attention-based compression is the closest to a standard transformer layer.
-
 ## What is actually compressed
 
 The token decoder still runs full causal self-attention over all $L$ tokens. Only the cross-attention KV cache scales as $L/k$. The theoretical KV compression at concept size $k$ is:
@@ -246,13 +244,24 @@ metrics_data, config_data = get_metrics_data(LCM_EXPERIMENTS_DIR, baseline_dirs=
 
 A 31M parameter model was trained on SlimPajama at sequence length 1024. The [baseline](https://github.com/clankur/seqax/blob/feat/lcm/configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
 
-At concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is not caused by compression but the architecture.
+At concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is caused by the architecture.
 
 ```{python}
 bs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)
 bs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=("baseline",)))
 plot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)
 ```
+
+## Impact of compression strategies
+
+Attention-based compression is the only strategy that appears in the top 10 experiments. Parameter counts for the reduction step at the 31M config ($d_\text{model}=256$, $n_{kv}=16$, $d_\text{head}=64$, $n_{q/kv}=1$):
+
+| Strategy | additional parameters |
+|---|---|
+| Sum | 0 |
+| Max | 0 |
+| Learned weighted sum | block_size |
+| Attention ($W_K$/$W_V$ + $W_O$ + $q$) | 787K |
 
 ## Scaling compute
 

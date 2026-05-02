@@ -12,6 +12,10 @@ seqax is a small (~500 LOC in `train.py`) LLM pretraining codebase in JAX, targe
 
 Whenever you run an experiment configuration, run it against `local_test_synthetic.yaml` using XLA since we are on a Mac. After any edit to `train.py`, `shardlib/`, or `input_loader.py`, run the local synthetic config and confirm loss decreases across the ~50 steps before declaring done.
 
+### Report style
+
+When writing reports, use the matx style: impersonal, declarative, no qualifiers, math where needed, tables for data, zero speculation that isn't backed by a measurement. Every section does exactly one thing.
+
 ## Common commands
 
 ### Install

@@ -14,16 +14,28 @@ The three stages are:
 
 All masks are combined with segment masks to prevent attention across packed sequence boundaries. The encoder mask uses strict inequality at the block level: tokens in block $i$ attend only to tokens in blocks $< i$. This prevents future leakage, since concept $i$ is consumed by the token decoder to predict tokens in block $i$.
 
-Four reduction strategies were tested for collapsing tokens within a block:
+## Compression strategies
 
-| Strategy | Description |
-|-------------------------------|----------------------------------------|
-| Sum | Element-wise sum of token representations |
-| Max | Element-wise max |
-| Learned weighted sum | Learnable scalar weight per position within the block |
-| Attention | Learnable query attends over block tokens |
+Four compression strategies were tested for collapsing tokens within a block:
+
+| Strategy | Formula | Description |
+|-------------------------------|------------------------------------------------------|----------------------------------------|
+| Sum | $c = \sum_{i=1}^{k} x_i$ | Element-wise sum of token representations |
+| Max | $c_j = \max_i\, x_{i,j}$ | Element-wise max over token representations |
+| Learned weighted sum | $c = \sum_{i=1}^{k} w_i x_i,\quad w \in \mathbb{R}^k$ learnable | Learnable scalar weight per position within the block |
+| Attention | $c = \mathrm{softmax}\!\left(\tfrac{q^\top (XW_K)^\top}{\sqrt{d}}\right)\!(XW_V)W_O$ | Constant learned query $q$ attends over projected block tokens |
 
 Implementation: [`forward_pass`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L377), [`encoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L415), [`concept_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L470), [`token_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L524).
+
+Attention-based compression is the only strategy that appears in the top 10 experiments. Sum, max, and learned weighted sum do not. This is expected: attention-based compression is the closest to a standard transformer layer.
+
+## What is actually compressed
+
+The token decoder still runs full causal self-attention over all $L$ tokens. Only the cross-attention KV cache scales as $L/k$. The theoretical KV compression at concept size $k$ is:
+
+$$\frac{n_\text{self-attn} \cdot L + n_\text{cross-attn} \cdot L/k}{(n_\text{self-attn} + n_\text{cross-attn}) \cdot L}$$
+
+At concept_size=8 with equal self-attention and cross-attention layers, this is a 56% compression in KV bytes. No memory or latency measurements were taken; the results below are loss-only.
 
 ### Divergences from the LCM paper
 
@@ -32,14 +44,6 @@ Implementation: [`forward_pass`](https://github.com/clankur/seqax/blob/feat/lcm/
 | Pretrained SONAR encoder/decoder | Jointly trained from scratch |
 | Dynamic sentence-level concepts (10--20 tokens, ≤200 chars) | Fixed-size token blocks |
 | Diffusion-based concept decoder (best variant) | Autoregressive concept decoder only |
-
-## What is actually compressed
-
-The token decoder still runs full causal self-attention over all $L$ tokens. Only the cross-attention KV cache scales as $L/k$. The theoretical KV reduction at concept size $k$ is:
-
-$$\frac{n_\text{self-attn} \cdot L + n_\text{cross-attn} \cdot L/k}{(n_\text{self-attn} + n_\text{cross-attn}) \cdot L}$$
-
-At concept_size=8 with equal self-attention and cross-attention layers, this is a 56% reduction in KV bytes. No memory or latency measurements were taken; the results below are loss-only.
 
 ```{python}
 import json
@@ -228,8 +232,8 @@ def get_eval_metrics_table(metrics_data, config_data, top_k=None):
             key = DISPLAY_KEY_OVERRIDES.get(d["kind"], {}).get(config_key, display_key)
             fields[key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
         name = d["name"]
-        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Eval Loss": float(d["final_loss"]), **fields})
-    df = pd.DataFrame(rows).sort_values("Eval Loss").reset_index(drop=True)
+        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Final Loss": float(d["final_loss"]), **fields})
+    df = pd.DataFrame(rows).sort_values("Final Loss").reset_index(drop=True)
     if top_k:
         df = df.head(top_k)
     return df.style.format(precision=6).set_properties(**{"text-align": "left"})
@@ -242,17 +246,13 @@ metrics_data, config_data = get_metrics_data(LCM_EXPERIMENTS_DIR, baseline_dirs=
 
 A 31M parameter model was trained on SlimPajama at sequence length 1024. The [baseline](https://github.com/clankur/seqax/blob/feat/lcm/configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
 
-At concept_size=1, there is no compression: each concept embedding represents exactly one token. The reduction step is a no-op. Any gap between this configuration and the baseline is purely architectural overhead from the encoder, concept decoder, and cross-attention path. The gap exists, which means the degradation is not caused by compression. It is caused by the architecture.
+At concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is not caused by compression but the architecture.
 
 ```{python}
 bs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)
 bs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=("baseline",)))
 plot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)
 ```
-
-## Reduction strategies
-
-Attention-based reduction is the only strategy that appears in the top 10 experiments. Sum, max, and learned weighted sum do not. This is expected: attention-based reduction is the closest to a standard transformer layer.
 
 ## Scaling compute
 
@@ -274,8 +274,6 @@ get_eval_metrics_table(seq_1024, config_data, top_k=10)
 ```
 
 ## Limitations
-
-"Eval Loss" in the tables above is the EMA-smoothed final training loss (not held-out eval). Results are from a single seed each. The directional result is consistent across the seq_len=1024 configurations, but exact gap sizes are not reliable without bootstrap CIs over ≥1M tokens with multiple seeds.
 
 Compute matching across LCM variants is approximate. The 4--8x FLOP range is a rough bound, not a controlled comparison along a single axis (parameters, training FLOPs, or inference FLOPs).
 

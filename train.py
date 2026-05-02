@@ -265,6 +265,9 @@ class LCMModel:
     final_layer_norm: f32[b"d_model/d/t"]
     reduce_ln: f32[b"d_model/d/t"]
     w_mix: f32[b"block_size 1"]
+    w_reduce_q: f32[b"1 n_q_per_kv n_kv/t d_head/d"]
+    w_reduce_kv: f32[b"2 d_model/d n_kv/t d_head"]
+    w_reduce_o: f32[b"d_model/d n_q_per_kv n_kv/t d_head"]
     x_w_q: f32[b"n_t_layers d_model/d n_q_per_kv n_kv/t d_head"]
     x_w_kv: f32[b"n_t_layers 2 d_model/d n_kv/t d_head"]
     x_w_o: f32[b"n_t_layers d_model/d n_q_per_kv n_kv/t d_head"]
@@ -350,6 +353,15 @@ class LCMModel:
         x_lnx = jnp.ones((h.n_t_layers, h.d_model), dtype=jnp.float32)
         x_lnz = jnp.ones((h.n_t_layers, h.d_model), dtype=jnp.float32)
         w_mix = jnp.ones((h.block_size, 1), dtype=jnp.float32)
+        w_reduce_q = w_q_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_reduce_q"), -2, 2, (1, h.n_q_per_kv, h.n_kv, h.d_head), dtype=jnp.float32
+        )
+        w_reduce_kv = w_kv_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_reduce_kv"), -2, 2, (2, h.d_model, h.n_kv, h.d_head), dtype=jnp.float32
+        )
+        w_reduce_o = w_o_scale * jax.random.truncated_normal(
+            fold_in_str(rng, "w_reduce_o"), -2, 2, (h.d_model, h.n_q_per_kv, h.n_kv, h.d_head), dtype=jnp.float32
+        )
 
         unembed = unembed_scale * jax.random.truncated_normal(
             fold_in_str(rng, "unembed"), -2, 2, (h.vocab, h.d_model), dtype=jnp.float32
@@ -364,6 +376,9 @@ class LCMModel:
             final_layer_norm=final_layer_norm,
             reduce_ln=reduce_ln,
             w_mix=w_mix,
+            w_reduce_q=w_reduce_q,
+            w_reduce_kv=w_reduce_kv,
+            w_reduce_o=w_reduce_o,
             x_w_q=x_w_q,
             x_w_kv=x_w_kv,
             x_w_o=x_w_o,
@@ -461,9 +476,48 @@ class LCMModel:
         nx_blocks = einops.rearrange(
             nx, "B (n_blocks block_size) M -> B n_blocks block_size M", block_size=h.block_size
         )
-        mix_weights = jax.nn.softmax(self.w_mix, axis=0)
-        z = jnp.sum(nx_blocks * mix_weights[None, None, :, :], axis=2)
-        z = shardops.psum_scatter("B/d n_blocks M -> B/d n_blocks M/t", z)
+        if h.reduction_strategy in ("sum", "max"):
+            z = einops.reduce(nx_blocks, "B n_blocks block_size M -> B n_blocks M", h.reduction_strategy)
+            z = shardops.psum_scatter("B/d n_blocks M -> B/d n_blocks M/t", z)
+        elif h.reduction_strategy == "wei_sum":
+            z = jnp.sum(nx_blocks * self.w_mix[None, None, :, :], axis=2)
+            z = shardops.psum_scatter("B/d n_blocks M -> B/d n_blocks M/t", z)
+        elif h.reduction_strategy == "attn":
+            w_reduce_q = shardops.all_gather(
+                "1 n_q_per_kv n_kv/t d_head/d -> 1 n_q_per_kv n_kv/t d_head", self.w_reduce_q
+            )
+            w_reduce_kv = shardops.all_gather(
+                "2 d_model/d n_kv/t d_head -> 2 d_model n_kv/t d_head", jnp.bfloat16(self.w_reduce_kv)
+            )
+            reduce_k, reduce_v = shardops.einsum_unreduced(
+                "B/d n_blocks block_size d_model, k_v d_model n_kv/t d_head -> k_v B/d n_blocks block_size n_kv/t d_head",
+                jnp.bfloat16(nx_blocks),
+                w_reduce_kv,
+            )
+            logits = shardops.einsum_unreduced(
+                "1 n_q_per_kv n_kv/t d_head, B/d n_blocks block_size n_kv/t d_head -> B/d 1 n_blocks block_size n_q_per_kv n_kv/t",
+                w_reduce_q,
+                reduce_k,
+                preferred_element_type=jnp.float32,
+            ) / math.sqrt(h.d_head)
+            attn_wei = jnp.bfloat16(jax.nn.softmax(logits, axis=3))
+            attn_out = shardops.einsum_unreduced(
+                "B/d 1 n_blocks block_size n_q_per_kv n_kv/t, B/d n_blocks block_size n_kv/t d_head -> B/d n_blocks n_q_per_kv n_kv/t d_head",
+                attn_wei,
+                reduce_v,
+            )
+            w_reduce_o = shardops.all_gather(
+                "d_model/d n_q_per_kv n_kv/t d_head -> d_model n_q_per_kv n_kv/t d_head",
+                jnp.bfloat16(self.w_reduce_o),
+            )
+            attn_out = shardops.einsum_unreduced(
+                "B/d n_blocks n_q_per_kv n_kv/t d_head, d_model n_q_per_kv n_kv/t d_head -> B/d n_blocks d_model",
+                attn_out,
+                w_reduce_o,
+            )
+            z = shardops.psum_scatter("B/d n_blocks d_model -> B/d n_blocks d_model/t", attn_out)
+        else:
+            raise ValueError(f"Unknown reduction_strategy: {h.reduction_strategy!r}")
 
         ##### Stage 3a: Concept Decoder
         @explicit_activation_checkpointing

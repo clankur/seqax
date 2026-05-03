@@ -67,7 +67,7 @@
     "href": "lcm.html#concept_size1-control",
     "title": "Jointly-trained LCM for KV cache compression",
     "section": "concept_size=1 control",
-    "text": "concept_size=1 control\nA 31M parameter model was trained on SlimPajama at sequence length 1024. The baseline without any concept architecture outperforms every LCM variant across the full training run.\nAt concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is not caused by compression but the architecture.\n\n\nCode\nbs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)\nbs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=(\"baseline\",)))\nplot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)"
+    "text": "concept_size=1 control\nA 31M parameter model was trained on SlimPajama at sequence length 1024. The baseline without any concept architecture outperforms every LCM variant across the full training run.\nAt concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is caused by the architecture.\n\n\nCode\nbs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)\nbs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=(\"baseline\",)))\nplot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)"
   },
   {
     "objectID": "lcm.html#impact-of-compression-strategies",

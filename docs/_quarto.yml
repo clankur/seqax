@@ -3,14 +3,22 @@ project:
   output-dir: _site
 
 website:
-  title: "seqax experiments"
+  title: "seqax"
   navbar:
     left:
+      - text: "Home"
+        href: index.qmd
+      - text: "Shared KV"
+        href: shared_kv.qmd
+      - text: "Position Embeddings"
+        href: position_embeddings.qmd
+      - text: "Power Scheduler"
+        href: power_scheduler.qmd
       - text: "LCM"
         href: lcm.qmd
 
 format:
   html:
-    theme: flatly
+    theme: united
     toc: true
     code-fold: true

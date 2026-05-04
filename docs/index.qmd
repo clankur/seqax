@@ -1,0 +1,12 @@
+---
+title: "seqax experiment reports"
+---
+
+Experiment reports from [seqax](https://github.com/clankur/seqax), a small LLM pretraining codebase in JAX.
+
+| Report | Summary |
+|--------|---------|
+| [Shared KV](shared_kv.qmd) | Tying keys and values in multi-head attention — tested at 270M and 1B on C4 |
+| [Position Embeddings](position_embeddings.qmd) | CoPE vs ALiBi vs RoPE at 31M scale |
+| [Power Scheduler](power_scheduler.qmd) | 95-run HPO sweep of the power-law LR schedule vs cosine at 37M |
+| [LCM](lcm.qmd) | Jointly-trained Large Concept Model for KV cache compression at 31M |

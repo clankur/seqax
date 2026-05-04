@@ -147,6 +147,7 @@ def _load_experiment(exp_dir, metrics_data, config_data, kind="lcm"):
         "steps": steps,
         "loss": loss,
         "final_loss": calculate_ema(loss)[-1],
+        "total_steps": steps[-1] + 1,
         "seq_len": _infer_seq_len(metadata),
         "kind": kind,
     }
@@ -160,6 +161,10 @@ def get_metrics_data(experiments_dir, baseline_dirs=()):
     for exp_dir in baseline_dirs:
         _load_experiment(exp_dir, metrics_data, config_data, kind="baseline")
     return metrics_data, config_data
+
+
+def filter_by_steps(metrics_data, total_steps):
+    return {k: v for k, v in metrics_data.items() if v["total_steps"] == total_steps}
 
 
 def filter_metrics(metrics_data, seq_len=None, block_size=None, kinds=("lcm", "baseline"), config_data=None):
@@ -230,7 +235,8 @@ def get_eval_metrics_table(metrics_data, config_data, top_k=None):
             key = DISPLAY_KEY_OVERRIDES.get(d["kind"], {}).get(config_key, display_key)
             fields[key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
         name = d["name"]
-        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Final Loss": float(d["final_loss"]), **fields})
+        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Final Loss": float(d["final_loss"]),
+                      "Steps": d["total_steps"], **fields})
     df = pd.DataFrame(rows).sort_values("Final Loss").reset_index(drop=True)
     if top_k:
         df = df.head(top_k)
@@ -276,10 +282,21 @@ The gap persists when scaling the LCM with 4--8x additional FLOPs:
 
 Additional capacity does not close the gap. Scaling heads to 64 or 128 also nullifies KV cache savings, since the concept decoder's own KV cache grows proportionally.
 
+1200-step experiments:
+
 ```{python}
 seq_1024 = filter_metrics(metrics_data, seq_len=1024)
-plot_loss_data(seq_1024, ema_smoothing=0.97, top_k=10, opacity=0.05)
-get_eval_metrics_table(seq_1024, config_data, top_k=10)
+seq_1024_1200 = filter_by_steps(seq_1024, 1200)
+plot_loss_data(seq_1024_1200, ema_smoothing=0.97, top_k=10, opacity=0.05)
+get_eval_metrics_table(seq_1024_1200, config_data, top_k=10)
+```
+
+2400-step experiments:
+
+```{python}
+seq_1024_2400 = filter_by_steps(seq_1024, 2400)
+plot_loss_data(seq_1024_2400, ema_smoothing=0.97, top_k=10, opacity=0.05)
+get_eval_metrics_table(seq_1024_2400, config_data, top_k=10)
 ```
 
 ## Limitations

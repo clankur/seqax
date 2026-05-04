@@ -403,4 +403,3 @@ The Power Scheduler is a reasonable alternative to cosine decay, but the evidenc
 - Runs with `amplitude` $\geq 4.5$ hit a learning rate cap at 0.02, making the amplitude parameter ineffective above that threshold.
 - The 13M power-law runs use default hyperparameters and do not sweep amplitude or exponent.
 - No eval loss or downstream task measurements beyond training loss are available.
-- The power-law schedule [implementation](https://github.com/clankur/muGPT/tree/power_scheduler) follows the paper's Section 4 but lives on a separate branch that is not merged into main.

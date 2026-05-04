@@ -417,6 +417,6 @@ df_summary.style.format({"Best Final Loss": "{:.6f}"}).set_properties(**{"text-a
 ## Limitations
 
 - 31M parameters only. Results may differ at larger scales where long-range dependencies matter more.
-- Context lengths are 512--1024 tokens. ALiBi and CoPE target length generalization, which is not tested here.
+- Context lengths are 1024 tokens. ALiBi and CoPE target length generalization, which is not tested here.
 - Cross-dataset comparisons are approximate. Only within-dataset comparisons at the same LR and step count are controlled.
 - No inference latency, memory, or length-generalization measurements were taken.

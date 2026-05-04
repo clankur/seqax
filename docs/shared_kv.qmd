@@ -274,7 +274,6 @@ At matched learning rate, shared KV is 0.025 nats behind at 270M and 0.018 nats 
 
 - All baselines use MHA (n_kv=16, n_q_per_kv=1). No comparison against GQA or MQA, which also reduce KV cache.
 - Only one shared KV run exists at each scale.
-- Learning rate ($3 \times 10^{-4}$) is the untuned default from `c4_a100x8_base.yaml`. A tuned LR may shift the gap in either direction.
 - No eval loss, perplexity, or downstream task metrics were recorded. All comparisons use training loss only.
 - No inference latency or KV cache memory measurements were taken.
 

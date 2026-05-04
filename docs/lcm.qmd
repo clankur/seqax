@@ -1,0 +1,321 @@
+---
+title: "Jointly-trained LCM for KV cache compression"
+---
+
+Meta's [Large Concept Models](https://arxiv.org/pdf/2412.08821) replace next-token prediction with next concept-embedding prediction. The architecture has three stages: a token-to-concept encoder, a concept-level decoder, and a concept-to-token decoder. By operating on concept embeddings instead of tokens, the KV cache for the concept decoder scales as $L / k$ instead of $L$, where $k$ is the concept size in tokens. A jointly-trained variant was tested and found to underperform a standard transformer at all concept sizes, including concept_size=1 where no compression occurs.
+
+## Architecture
+
+The three stages are:
+
+1.  **Encoder.** Tokens attend to all tokens in the same block and all previous blocks ($\leq i$), then a reduction operation collapses each block of $k$ tokens into a single concept embedding.
+2.  **Concept decoder.** Standard causal transformer over the sequence of concept embeddings.
+3.  **Token decoder.** Causal self-attention over tokens, plus cross-attention to concept embeddings from blocks $< i$.
+
+All masks are combined with segment masks to prevent attention across packed sequence boundaries. The encoder mask uses strict inequality at the block level: tokens in block $i$ attend only to tokens in blocks $< i$. This prevents future leakage, since concept $i$ is consumed by the token decoder to predict tokens in block $i$.
+
+## Compression strategies
+
+Four compression strategies were tested for collapsing tokens within a block:
+
+| Strategy | Formula | Description |
+|-------------------------------|------------------------------------------------------|----------------------------------------|
+| Sum | $c = \sum_{i=1}^{k} x_i$ | Element-wise sum of token representations |
+| Max | $c_j = \max_i\, x_{i,j}$ | Element-wise max over token representations |
+| Learned weighted sum | $c = \sum_{i=1}^{k} w_i x_i,\quad w \in \mathbb{R}^k$ learnable | Learnable scalar weight per position within the block |
+| Attention | $c = \mathrm{softmax}\!\left(\tfrac{q^\top (XW_K)^\top}{\sqrt{d}}\right)\!(XW_V)W_O$ | Constant learned query $q$ attends over projected block tokens |
+
+Implementation: [`forward_pass`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L377), [`encoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L415), [`concept_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L470), [`token_decoder_body`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L524).
+
+## What is actually compressed
+
+The token decoder still runs full causal self-attention over all $L$ tokens. Only the cross-attention KV cache scales as $L/k$. The theoretical KV compression at concept size $k$ is:
+
+$$\frac{n_\text{self-attn} \cdot L + n_\text{cross-attn} \cdot L/k}{(n_\text{self-attn} + n_\text{cross-attn}) \cdot L}$$
+
+At concept_size=8 with equal self-attention and cross-attention layers, this is a 56% compression in KV bytes. No memory or latency measurements were taken; the results below are loss-only.
+
+### Divergences from the LCM paper
+
+| LCM paper | This implementation |
+|-------------------------|-----------------------------------------------|
+| Pretrained SONAR encoder/decoder | Jointly trained from scratch |
+| Dynamic sentence-level concepts (10--20 tokens, ≤200 chars) | Fixed-size token blocks |
+| Diffusion-based concept decoder (best variant) | Autoregressive concept decoder only |
+
+```{python}
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = "plotly_mimetype+notebook_connected"
+
+LCM_EXPERIMENTS_DIR = Path("../clearml_experiments/slim_v4_32_31m/lcm")
+BASELINE_1024_DIR = Path("../clearml_experiments/slim_v4_32_31m/main/slim_v4_32_31m_lcm_baseline_b5ed44ff59864cf69c4f84d4ad2db5be")
+
+# Window during which the encoder/cross-attention mask used `>=` and leaked within-block
+# future tokens. Every block_size>1 run trained in this window beats the baseline; the fix
+# (strict `>`) was in place before 2025-01-04 16:16 UTC and after 2025-01-05 06:26 UTC.
+LEAKY_WINDOW = (
+    datetime(2025, 1, 4, 22, 0, tzinfo=timezone.utc),
+    datetime(2025, 1, 5, 6, 0, tzinfo=timezone.utc),
+)
+
+TRACKED_FIELDS = [
+    ("block_size", "Block_Size"),
+    ("layers", "Concept_Decoder_Layers"),
+    ("n_e_layers", "Encoder_Layers"),
+    ("n_t_layers", "Token_Decoder_Layers"),
+    ("reduction_strategy", "Reduction_Strategy"),
+    ("n_kv", "Attention_Heads"),
+    ("learning_rate", "Learning_Rate"),
+    ("d_model", "d_model"),
+    ("d_ff", "d_ff"),
+]
+# `model.layers` means concept decoder depth in LCM rows and total transformer
+# depth in baseline rows; route it to a different display column per kind.
+DISPLAY_KEY_OVERRIDES = {"baseline": {"layers": "Transformer_Layers"}}
+
+# Defaults for runs that didn't override these fields. The baseline
+# (configs/slim_v4-32_31m.yaml) and the LCM runs (configs/slim_v4-8_31m.yaml)
+# inherit the same model section from configs/slim_base.yaml.
+SHARED_DEFAULTS = {
+    "d_model": 256,
+    "d_ff": 1024,
+    "n_kv": 16,
+    "layers": 8,
+    "learning_rate": 1.35e-2,
+}
+
+
+def calculate_ema(data, smoothing=0.97):
+    ema = [data[0]]
+    for value in data[1:]:
+        ema.append(ema[-1] * smoothing + value * (1 - smoothing))
+    return ema
+
+
+def _read_csv(path):
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    return df["step"].tolist(), df["value"].tolist()
+
+
+def _parse_config(metadata):
+    hp = metadata.get("hyperparameters", {})
+    config = {}
+    for key, val in hp.items():
+        if not key.startswith("Hydra/"):
+            continue
+        suffix = key.removeprefix("Hydra/")
+        if suffix.startswith("model."):
+            config[suffix.removeprefix("model.")] = val
+        elif suffix.startswith("training."):
+            config[suffix.removeprefix("training.")] = val
+    return config
+
+
+def _infer_seq_len(metadata):
+    name = metadata["experiment_name"]
+    if "seq_len=2048" in name or metadata.get("hyperparameters", {}).get("Hydra/training.token.len") == "2048":
+        return 2048
+    return 1024
+
+
+def _load_experiment(exp_dir, metrics_data, config_data, kind="lcm"):
+    metadata = json.loads((exp_dir / "metadata.json").read_text())
+    if _infer_seq_len(metadata) != 1024:
+        return
+    created = datetime.fromisoformat(metadata["created"].replace(" ", "T"))
+    if kind == "lcm" and LEAKY_WINDOW[0] <= created < LEAKY_WINDOW[1]:
+        kind = "leaky"
+    task_id = metadata["experiment_id"]
+    config_data[task_id] = _parse_config(metadata)
+    loss_csv = _read_csv(exp_dir / "metrics" / "loss_loss.csv")
+    if loss_csv is None:
+        return
+    steps, loss = loss_csv
+    name = metadata["experiment_name"].replace("model.", "").removeprefix("slim_v4-32_31m_")
+    metrics_data[task_id] = {
+        "name": name,
+        "steps": steps,
+        "loss": loss,
+        "final_loss": calculate_ema(loss)[-1],
+        "total_steps": steps[-1] + 1,
+        "seq_len": _infer_seq_len(metadata),
+        "kind": kind,
+    }
+
+
+def get_metrics_data(experiments_dir, baseline_dirs=()):
+    metrics_data, config_data = {}, {}
+    for exp_dir in sorted(experiments_dir.iterdir()):
+        if exp_dir.is_dir():
+            _load_experiment(exp_dir, metrics_data, config_data, kind="lcm")
+    for exp_dir in baseline_dirs:
+        _load_experiment(exp_dir, metrics_data, config_data, kind="baseline")
+    return metrics_data, config_data
+
+
+def filter_by_steps(metrics_data, total_steps):
+    return {k: v for k, v in metrics_data.items() if v["total_steps"] == total_steps}
+
+
+def filter_metrics(metrics_data, seq_len=None, block_size=None, kinds=("lcm", "baseline"), config_data=None):
+    out = {}
+    for guid, d in metrics_data.items():
+        if seq_len is not None and d["seq_len"] != seq_len:
+            continue
+        if d["kind"] not in kinds:
+            continue
+        if block_size is not None and d["kind"] == "lcm":
+            cfg = (config_data or {}).get(guid, {})
+            if str(cfg.get("block_size")) != str(block_size):
+                continue
+        out[guid] = d
+    return out
+
+
+def get_top_k_experiments(loss_data, k=None, ema_smoothing=0.97):
+    sorted_exps = sorted(loss_data.items(), key=lambda x: calculate_ema(x[1]["loss"], smoothing=ema_smoothing)[-1])
+    return dict(sorted_exps[:k] if k else sorted_exps)
+
+
+def plot_loss_data(loss_data, ema_smoothing=0.97, top_k=None, opacity=0.25):
+    if top_k:
+        loss_data = get_top_k_experiments(loss_data, k=top_k, ema_smoothing=ema_smoothing)
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+               "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    fig = go.Figure()
+    for i, (_, data) in enumerate(loss_data.items()):
+        steps, loss = data["steps"], data["loss"]
+        ema = calculate_ema(loss, smoothing=ema_smoothing)
+        color = palette[i % len(palette)]
+        fig.add_trace(go.Scatter(
+            x=steps, y=loss, mode="lines", name=data["name"],
+            legendgroup=data["name"], showlegend=False,
+            line=dict(color=color, width=1), opacity=opacity, hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=steps, y=ema, mode="lines", name=data["name"],
+            legendgroup=data["name"],
+            line=dict(color=color, width=2),
+            hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.4f}<extra></extra>",
+        ))
+    fig.update_layout(
+        xaxis_title="Steps", yaxis_title="Loss",
+        height=600, hovermode="closest",
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(l=60, r=20, t=20, b=80),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.show()
+
+
+def get_eval_metrics_table(metrics_data, config_data, top_k=None):
+    rows = []
+    for guid, d in metrics_data.items():
+        if d["final_loss"] is None:
+            continue
+        fields = {}
+        cfg = config_data[guid]
+        for config_key, display_key in TRACKED_FIELDS:
+            val = cfg.get(config_key)
+            if val is None:
+                val = SHARED_DEFAULTS.get(config_key)
+            if val is None:
+                continue
+            key = DISPLAY_KEY_OVERRIDES.get(d["kind"], {}).get(config_key, display_key)
+            fields[key] = float(val) if config_key == "learning_rate" else (val if config_key == "reduction_strategy" else int(val))
+        name = d["name"]
+        rows.append({"Name": name if len(name) < 25 else name[:25] + "...", "Final Loss": float(d["final_loss"]),
+                      "Steps": d["total_steps"], **fields})
+    df = pd.DataFrame(rows).sort_values("Final Loss").reset_index(drop=True)
+    if top_k:
+        df = df.head(top_k)
+    return df.style.format(precision=6).set_properties(**{"text-align": "left"})
+
+
+metrics_data, config_data = get_metrics_data(LCM_EXPERIMENTS_DIR, baseline_dirs=[BASELINE_1024_DIR])
+```
+
+## concept_size=1 control
+
+A 31M parameter model was trained on SlimPajama at sequence length 1024. The [baseline](https://github.com/clankur/seqax/blob/feat/lcm/configs/slim_v4-32_31m.yaml) without any concept architecture outperforms every LCM variant across the full training run.
+
+At concept_size=1, there is no compression: each concept embedding represents exactly one token. The gap exists, which means the degradation is caused by the architecture.
+
+```{python}
+bs1_vs_baseline = filter_metrics(metrics_data, seq_len=1024, block_size=1, config_data=config_data)
+bs1_vs_baseline.update(filter_metrics(metrics_data, seq_len=1024, kinds=("baseline",)))
+plot_loss_data(bs1_vs_baseline, ema_smoothing=0.97, opacity=0.1)
+```
+
+## Impact of compression strategies
+
+Attention-based compression is the only strategy that appears in the top 10 experiments. Parameter counts for the reduction step at the 31M config ($d_\text{model}=256$, $n_{kv}=16$, $d_\text{head}=64$, $n_{q/kv}=1$):
+
+| Strategy | additional parameters |
+|---|---|
+| Sum | 0 |
+| Max | 0 |
+| Learned weighted sum | block_size |
+| Attention ($W_K$/$W_V$ + $W_O$ + $q$) | 787K |
+
+## Scaling compute
+
+The gap persists when scaling the LCM with 4--8x additional FLOPs:
+
+| Scaling axis     | Values tested                                        |
+|------------------|------------------------------------------------------|
+| Attention heads  | 32, 64, 128                                          |
+| $d_\text{model}$ | 384, 512                                             |
+| $d_\text{ff}$    | $4 \times d_\text{model}$, $8 \times d_\text{model}$ |
+| LCM depth        | increased                                            |
+
+Additional capacity does not close the gap. Scaling heads to 64 or 128 also nullifies KV cache savings, since the concept decoder's own KV cache grows proportionally.
+
+1200-step experiments:
+
+```{python}
+seq_1024 = filter_metrics(metrics_data, seq_len=1024)
+seq_1024_1200 = filter_by_steps(seq_1024, 1200)
+plot_loss_data(seq_1024_1200, ema_smoothing=0.97, top_k=10, opacity=0.05)
+get_eval_metrics_table(seq_1024_1200, config_data, top_k=10)
+```
+
+2400-step experiments:
+
+```{python}
+seq_1024_2400 = filter_by_steps(seq_1024, 2400)
+plot_loss_data(seq_1024_2400, ema_smoothing=0.97, top_k=10, opacity=0.05)
+get_eval_metrics_table(seq_1024_2400, config_data, top_k=10)
+```
+
+## Limitations
+
+Compute matching across LCM variants is approximate. The 4--8x FLOP range is a rough bound, not a controlled comparison along a single axis (parameters, training FLOPs, or inference FLOPs).
+
+31M parameters at $L$ = 1024 is below the regime where LCM-style methods are expected to help. The LCM paper's claims center on long-context semantic compression. A negative result at this scale does not rule out the architecture at larger scales or longer contexts.
+
+No experiment measures actual KV cache memory, prefill latency, or decode latency.
+
+## Next experiments
+
+The concept_size=1 result narrows the problem to the architecture but does not identify which component is responsible. The following ablations at concept_size=1 would decompose the gap:
+
+| Ablation | What it isolates |
+|---------------------------|---------------------------------------------|
+| Skip concept decoder (encoder → token decoder directly) | Cost of the concept decoder |
+| Identity encoder (concept decoder + cross-attention, no learned encoding) | Cost of the encoder |
+| Tied weights across all three sub-networks | Cost of joint optimization |
+| Initialize encoder/decoder from trained baseline | Joint training vs. architecture |
+
+Other experiments in rough priority order: disable sequence packing to rule out concept boundary corruption from packed documents; increase context length to $L$ = 4096 where the LCM thesis applies; measure actual KV cache memory and latency to plot the loss-vs-KV-bytes Pareto frontier; add an auxiliary chunk-reconstruction loss to force concept embeddings to be informative.

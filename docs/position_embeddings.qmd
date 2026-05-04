@@ -1,0 +1,422 @@
+---
+title: "Position embeddings: CoPE vs ALiBi vs RoPE"
+---
+
+Three position embedding methods were compared across multiple datasets and model scales: Rotary Position Embeddings (RoPE), Contextual Position Encoding (CoPE), and Attention with Linear Biases (ALiBi). RoPE is the default in seqax. CoPE and ALiBi were implemented on feature branches and tested against RoPE baselines. RoPE consistently matches or outperforms both alternatives at the 31M parameter scale tested. All comparisons use EMA-smoothed final training loss.
+
+## Position embedding methods
+
+**RoPE** ([Su et al., 2021](https://arxiv.org/abs/2104.09864)) applies a rotation to query and key vectors based on absolute position. Each pair of dimensions in the head is rotated by $\theta_i \cdot t$ where $t$ is the position index and $\theta_i$ is a frequency drawn from a geometric series up to `rope_max_timescale`. The rotation makes the dot product between query and key a function of their relative position.
+
+**CoPE** ([Golovneva et al., 2024](https://arxiv.org/abs/2405.18719)) computes context-dependent positions by applying a sigmoid gate to attention logits and cumulatively summing the gates. These fractional positions index into a learned position embedding table via linear interpolation. The position-dependent bias is added to the attention logits. CoPE adds $n_{q} \times n_{kv} \times d_\text{head} \times n_\text{pos\_max}$ parameters.
+
+**ALiBi** ([Press et al., 2022](https://arxiv.org/abs/2108.12409)) adds a fixed linear bias $m \cdot (i - j)$ to each attention logit, where $m$ is a per-head slope drawn from a geometric series. ALiBi adds zero learnable parameters.
+
+Implementation: [`Cope`](https://github.com/clankur/seqax/blob/029fe3f/train.py#L584), [`Alibi`](https://github.com/clankur/seqax/blob/029fe3f/train.py#L643), [`RopeTable`](https://github.com/clankur/seqax/blob/feat/lcm/train.py#L250).
+
+```{python}
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = "plotly_mimetype+notebook_connected"
+
+BASE = Path("../clearml_experiments")
+
+# Groups with position-embedding experiments and comparable baselines.
+# Each entry: (group_name, list of (variant_dir, ...))
+EXPERIMENT_SOURCES = {
+    "slim_v4_32_31m": {
+        "label": "SlimPajama 31M (v4-32)",
+        "dirs": [
+            BASE / "slim_v4_32_31m" / "main",
+            BASE / "slim_v4_32_31m" / "alibi",
+        ],
+    },
+    "c4_v4_32_31m": {
+        "label": "C4 31M (v4-32)",
+        "dirs": [
+            BASE / "c4_v4_32_31m" / "alibi",
+        ],
+    },
+    "wikitext103_v4_32_31m": {
+        "label": "WikiText-103 31M (v4-32)",
+        "dirs": [
+            BASE / "wikitext103_v4_32_31m" / "cope",
+            BASE / "wikitext103_v4_32_31m" / "alibi",
+        ],
+    },
+}
+
+TRACKED_FIELDS = [
+    ("apply_cope", "CoPE"),
+    ("apply_rope", "RoPE"),
+    ("apply_alibi", "ALiBi"),
+    ("learning_rate", "LR"),
+    ("n_kv", "n_kv"),
+    ("n_q_per_kv", "n_q_per_kv"),
+]
+
+PALETTE = {
+    "rope": "#1f77b4",
+    "cope": "#ff7f0e",
+    "alibi": "#2ca02c",
+    "cope+rope": "#d62728",
+    "nope": "#9467bd",
+}
+PALETTE_LIST = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+def calculate_ema(data, smoothing=0.97):
+    ema = [data[0]]
+    for value in data[1:]:
+        ema.append(ema[-1] * smoothing + value * (1 - smoothing))
+    return ema
+
+
+def _read_csv(path):
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    return df["step"].tolist(), df["value"].tolist()
+
+
+def _parse_config(metadata):
+    hp = metadata.get("hyperparameters", {})
+    config = {}
+    for key, val in hp.items():
+        if not key.startswith("Hydra/"):
+            continue
+        suffix = key.removeprefix("Hydra/")
+        if suffix.startswith("model."):
+            config[suffix.removeprefix("model.")] = val
+        elif suffix.startswith("training."):
+            config[suffix.removeprefix("training.")] = val
+    return config
+
+
+def classify_pos_embed(config):
+    """Determine position embedding type from hyperparameters.
+
+    Rules:
+      - If apply_cope is explicitly True and apply_rope is True -> cope+rope
+      - If apply_cope is explicitly True -> cope
+      - If apply_alibi is explicitly True -> alibi
+      - If apply_cope is False and apply_rope is False and apply_alibi is not True -> nope
+      - Otherwise (default, or apply_rope=True) -> rope
+    """
+    cope = str(config.get("apply_cope", "N/A")).lower()
+    rope = str(config.get("apply_rope", "N/A")).lower()
+    alibi = str(config.get("apply_alibi", "N/A")).lower()
+
+    if cope == "true" and rope == "true":
+        return "cope+rope"
+    if cope == "true":
+        return "cope"
+    if alibi == "true":
+        return "alibi"
+    if cope == "false" and rope == "false" and alibi != "true":
+        return "nope"
+    # Default: RoPE (the seqax default, or explicit apply_rope=True)
+    return "rope"
+
+
+def _load_experiment(exp_dir, metrics_data, config_data, group):
+    meta_path = exp_dir / "metadata.json"
+    if not meta_path.exists():
+        return
+    metadata = json.loads(meta_path.read_text())
+    if metadata["status"] not in ("completed",):
+        return
+    hp = metadata.get("hyperparameters", {})
+    token_len = hp.get("Hydra/training.token.len")
+    if token_len is not None and str(token_len) != "1024":
+        return
+    if hp.get("Hydra/model.n_h") or hp.get("Hydra/model.d_compressed"):
+        return
+    name = metadata["experiment_name"]
+    if "lcm" in name.lower():
+        return
+    created = datetime.fromisoformat(metadata["created"].replace(" ", "T"))
+    LEAKY_WINDOW = (
+        datetime(2025, 1, 4, 22, 0, tzinfo=timezone.utc),
+        datetime(2025, 1, 6, 0, 0, tzinfo=timezone.utc),
+    )
+    if LEAKY_WINDOW[0] <= created < LEAKY_WINDOW[1]:
+        return
+    task_id = metadata["experiment_id"]
+    config = _parse_config(metadata)
+    config_data[task_id] = config
+
+    loss_csv = _read_csv(exp_dir / "metrics" / "loss_loss.csv")
+    if loss_csv is None:
+        return
+    steps, loss = loss_csv
+    if len(steps) < 10:
+        return
+
+    pos_type = classify_pos_embed(config)
+    name = metadata["experiment_name"]
+    # Strip common group prefix for display
+    for prefix in [group.replace("_", "-") + "_", group + "_"]:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    # Normalize legacy config names for display
+    name = name.replace("c4_a100x8x4", "c4_v4_32")
+
+    metrics_data[task_id] = {
+        "name": name,
+        "steps": steps,
+        "loss": loss,
+        "final_loss": calculate_ema(loss)[-1],
+        "total_steps": steps[-1] + 1,
+        "pos_type": pos_type,
+        "group": group,
+        "lr": config.get("learning_rate", "default"),
+    }
+
+
+def load_group(group_name):
+    """Load all experiments for a group."""
+    metrics_data, config_data = {}, {}
+    source = EXPERIMENT_SOURCES[group_name]
+    for d in source["dirs"]:
+        if not d.exists():
+            continue
+        for exp_dir in sorted(d.iterdir()):
+            if exp_dir.is_dir():
+                _load_experiment(exp_dir, metrics_data, config_data, group_name)
+    return metrics_data, config_data
+
+
+def load_all_groups():
+    """Load all experiments across all groups."""
+    all_metrics, all_config = {}, {}
+    for group_name in EXPERIMENT_SOURCES:
+        m, c = load_group(group_name)
+        all_metrics.update(m)
+        all_config.update(c)
+    return all_metrics, all_config
+
+
+def filter_by_steps(metrics_data, total_steps):
+    return {k: v for k, v in metrics_data.items() if v["total_steps"] == total_steps}
+
+
+def step_counts(metrics_data):
+    from collections import Counter
+    return Counter(d["total_steps"] for d in metrics_data.values())
+
+
+def filter_by_pos_type(metrics_data, pos_types):
+    return {k: v for k, v in metrics_data.items() if v["pos_type"] in pos_types}
+
+
+def filter_by_group(metrics_data, group):
+    return {k: v for k, v in metrics_data.items() if v["group"] == group}
+
+
+def filter_by_lr(metrics_data, lr="default"):
+    return {k: v for k, v in metrics_data.items() if str(v["lr"]) == str(lr)}
+
+
+def get_top_k_experiments(loss_data, k=None, ema_smoothing=0.97):
+    sorted_exps = sorted(
+        loss_data.items(),
+        key=lambda x: calculate_ema(x[1]["loss"], smoothing=ema_smoothing)[-1],
+    )
+    return dict(sorted_exps[:k] if k else sorted_exps)
+
+
+def plot_loss_data(loss_data, ema_smoothing=0.97, top_k=None, opacity=0.25,
+                   color_by_pos_type=True, title=None):
+    if top_k:
+        loss_data = get_top_k_experiments(loss_data, k=top_k, ema_smoothing=ema_smoothing)
+
+    fig = go.Figure()
+    for i, (_, data) in enumerate(loss_data.items()):
+        steps, loss = data["steps"], data["loss"]
+        ema = calculate_ema(loss, smoothing=ema_smoothing)
+        if color_by_pos_type:
+            color = PALETTE.get(data["pos_type"], PALETTE_LIST[i % len(PALETTE_LIST)])
+        else:
+            color = PALETTE_LIST[i % len(PALETTE_LIST)]
+        label = f"[{data['pos_type']}] {data['name']}"
+        fig.add_trace(go.Scatter(
+            x=steps, y=loss, mode="lines", name=label,
+            legendgroup=label, showlegend=False,
+            line=dict(color=color, width=1), opacity=opacity, hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=steps, y=ema, mode="lines", name=label,
+            legendgroup=label,
+            line=dict(color=color, width=2),
+            hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.4f}<extra></extra>",
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Steps", yaxis_title="Loss",
+        height=600, hovermode="closest",
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(l=60, r=20, t=40, b=80),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.show()
+
+
+def make_summary_table(metrics_data, config_data):
+    rows = []
+    for guid, d in metrics_data.items():
+        if d["final_loss"] is None:
+            continue
+        cfg = config_data.get(guid, {})
+        lr = cfg.get("learning_rate", "default")
+        rows.append({
+            "Name": d["name"][:40] if len(d["name"]) > 40 else d["name"],
+            "Group": d["group"],
+            "Pos. Embed": d["pos_type"],
+            "LR": lr,
+            "Final Loss (EMA)": float(d["final_loss"]),
+            "Steps": d["steps"][-1] if d["steps"] else 0,
+        })
+    df = pd.DataFrame(rows).sort_values("Final Loss (EMA)").reset_index(drop=True)
+    return df
+
+
+all_metrics, all_config = load_all_groups()
+
+# Summary counts
+from collections import Counter
+group_type_counts = Counter()
+for d in all_metrics.values():
+    group_type_counts[(d["group"], d["pos_type"])] += 1
+
+print("Loaded experiments by group and position embedding type:")
+for (g, t), c in sorted(group_type_counts.items()):
+    print(f"  {g}/{t}: {c}")
+```
+
+## SlimPajama 31M (v4-32): ALiBi vs RoPE
+
+Ten RoPE baselines and one completed ALiBi run. ALiBi (final loss 1.86) underperforms all RoPE baselines (best 0.87) by a wide margin.
+
+```{python}
+slim = filter_by_group(all_metrics, "slim_v4_32_31m")
+plot_loss_data(slim, ema_smoothing=0.97, opacity=0.1,
+               title="SlimPajama 31M (v4-32): ALiBi vs RoPE")
+```
+
+```{python}
+df_slim = make_summary_table(slim, all_config)
+df_slim.style.format({"Final Loss (EMA)": "{:.6f}"}).set_properties(**{"text-align": "left"})
+```
+
+## C4 31M (v4-32): ALiBi vs RoPE
+
+All runs train for 2400 steps. One RoPE run provides the baseline.
+
+```{python}
+c4 = filter_by_group(all_metrics, "c4_v4_32_31m")
+plot_loss_data(c4, ema_smoothing=0.97, opacity=0.1,
+               title="C4 31M (v4-32): ALiBi vs RoPE")
+```
+
+```{python}
+df_c4 = make_summary_table(c4, all_config)
+df_c4.style.format({"Final Loss (EMA)": "{:.6f}"}).set_properties(**{"text-align": "left"})
+```
+
+## WikiText-103 31M (v4-32): CoPE vs RoPE learning rate sweep
+
+Paired LR sweep across 11 learning rates: one CoPE run and one RoPE run per LR, all trained for 2900 steps.
+
+```{python}
+wiki = filter_by_group(all_metrics, "wikitext103_v4_32_31m")
+wiki = filter_by_steps(wiki, 2900)
+plot_loss_data(wiki, ema_smoothing=0.97, opacity=0.1, color_by_pos_type=True,
+               title="WikiText-103 31M (v4-32): CoPE vs RoPE LR sweep")
+```
+
+```{python}
+df_wiki = make_summary_table(wiki, all_config)
+df_wiki.style.format({"Final Loss (EMA)": "{:.6f}"}).set_properties(**{"text-align": "left"})
+```
+
+### Learning rate sensitivity
+
+```{python}
+wiki_cope = filter_by_pos_type(wiki, {"cope"})
+wiki_rope = filter_by_pos_type(wiki, {"rope"})
+
+# Build LR vs final loss table
+rows = []
+for guid, d in wiki_cope.items():
+    rows.append({"LR": float(d["lr"]) if d["lr"] != "default" else None, "Method": "CoPE", "Final Loss": d["final_loss"]})
+for guid, d in wiki_rope.items():
+    rows.append({"LR": float(d["lr"]) if d["lr"] != "default" else None, "Method": "RoPE", "Final Loss": d["final_loss"]})
+
+df_lr = pd.DataFrame(rows).dropna(subset=["LR"]).sort_values(["Method", "LR"])
+
+fig = go.Figure()
+for method, color in [("RoPE", PALETTE["rope"]), ("CoPE", PALETTE["cope"])]:
+    subset = df_lr[df_lr["Method"] == method].sort_values("LR")
+    fig.add_trace(go.Scatter(
+        x=subset["LR"], y=subset["Final Loss"],
+        mode="lines+markers", name=method,
+        line=dict(color=color, width=2),
+        marker=dict(size=6),
+    ))
+fig.update_layout(
+    title="WikiText-103 31M: LR sensitivity",
+    xaxis_title="Learning Rate", yaxis_title="Final Loss (EMA)",
+    xaxis_type="log", height=450,
+    margin=dict(l=60, r=20, t=40, b=60),
+)
+fig.show()
+```
+
+```{python}
+# Best LR per method
+best_lr = df_lr.loc[df_lr.groupby("Method")["Final Loss"].idxmin()]
+best_lr.style.format({"LR": "{:.6f}", "Final Loss": "{:.6f}"}).set_properties(**{"text-align": "left"})
+```
+
+## Cross-group summary
+
+Best final loss per method per dataset.
+
+```{python}
+summary_rows = []
+for group_name, source in EXPERIMENT_SOURCES.items():
+    group_data = filter_by_group(all_metrics, group_name)
+    for pos_type in ["rope", "cope", "alibi", "cope+rope", "nope"]:
+        typed = filter_by_pos_type(group_data, {pos_type})
+        if not typed:
+            continue
+        best = min(typed.values(), key=lambda d: d["final_loss"])
+        summary_rows.append({
+            "Group": source["label"],
+            "Method": pos_type.upper(),
+            "Best Final Loss": best["final_loss"],
+            "N runs": len(typed),
+            "Best run": best["name"][:35],
+        })
+
+df_summary = pd.DataFrame(summary_rows)
+df_summary.style.format({"Best Final Loss": "{:.6f}"}).set_properties(**{"text-align": "left"})
+```
+
+## Limitations
+
+- 31M parameters only. Results may differ at larger scales where long-range dependencies matter more.
+- Context lengths are 512--1024 tokens. ALiBi and CoPE target length generalization, which is not tested here.
+- Cross-dataset comparisons are approximate. Only within-dataset comparisons at the same LR and step count are controlled.
+- No inference latency, memory, or length-generalization measurements were taken.

@@ -1,0 +1,16 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "seqax experiments"
+  navbar:
+    left:
+      - text: "LCM"
+        href: lcm.qmd
+
+format:
+  html:
+    theme: flatly
+    toc: true
+    code-fold: true

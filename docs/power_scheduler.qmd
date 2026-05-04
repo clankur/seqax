@@ -1,0 +1,406 @@
+---
+title: "Review: Power Scheduler (Shen et al., 2024)"
+---
+
+[Power Scheduler: A Batch Size and Token Number Agnostic Learning Rate Scheduler](https://arxiv.org/abs/2408.13359) proposes a learning rate schedule derived from an empirical power-law relationship between the optimal learning rate, batch size, and number of training tokens. The schedule continuously decays the learning rate as $\eta(n) = \beta \cdot a \cdot n^b$ (where $n$ is tokens seen so far), eliminating the need to specify total training steps in advance — unlike cosine decay or the stable phase of WSD. Combined with Maximum Update Parameterization (muP), the authors claim a single set of hyperparameters transfers across token counts, batch sizes, model sizes, and architectures (dense and MoE).
+
+We ran a 95-run HPO sweep at 37M scale to test whether the power-law schedule improves over cosine decay in our codebase. It does not — the best power-law configurations match but do not beat the cosine baseline at 2900 steps. The rest of this document reviews the paper's claims, then presents our replication results.
+
+## Paper summary
+
+### The power-law relationship
+
+The core empirical finding comes from exhaustive grid searches over three proxy model sizes (12M, 36M, 121M parameters) trained on RedPajama. For each combination of training tokens $T \in \{2\text{B}, \ldots, 256\text{B}\}$, batch size $\beta \in \{16, \ldots, 512\}$, and learning rate $\eta \in \{0.0002, \ldots, 0.0256\}$, they find the loss-minimizing learning rate. The result: $\eta_\text{opt} = \beta \cdot a \cdot T^b$, with fitted coefficients $a \approx 4.6$, $b \approx -0.51$. The exponent being close to $-0.5$ (inverse square root of tokens) is suggestive but unexplored by the authors.
+
+### The schedule
+
+Three phases:
+
+1. **Warmup.** Linear ramp to $\eta_\text{power}(N_\text{warmup})$.
+2. **Power phase.** $\eta(n) = \min(\eta_\text{max},\; \beta \cdot a \cdot n^b)$ — the learning rate continuously decays as a function of tokens seen, unlike WSD which holds constant then decays.
+3. **Decay phase.** Exponential decay to 0 over the final ~10% of training.
+
+The authors use $a = 4$, $b = -0.51$, $\eta_\text{max} = 0.02$ for all experiments. The reduction from the empirically fitted $a = 4.6$ to the deployed $a = 4$ is not explained.
+
+[Our implementation](https://github.com/clankur/muGPT/tree/power_scheduler) follows Section 4 directly. The power phase computes $\eta(n) = \min\!\bigl(\eta_\text{max},\; \beta \cdot a \cdot (\underbrace{n \cdot \beta \cdot L}_{\text{tokens seen}})^{b}\bigr)$ where $\beta$ is batch size and $L$ is sequence length. The cooldown uses exponential half-life decay: $\eta_\text{decay}(n) = 0.5^{(n - S)/T} \cdot \eta_\text{power}(S)$, where $S$ is the step where cooldown begins and $T$ is cooldown length (10% of total steps). This means the final learning rate is $0.5 \times \eta_\text{power}(S)$, not zero — a detail the paper leaves unspecified.
+
+### Experimental claims
+
+At 1B scale (1T tokens, controlled comparison), the Power Scheduler achieves 58.2% average zero-shot accuracy vs. 57.7% for cosine and 57.6% for WSD — a 0.5-point improvement. At 3B scale, PowerLM-3B (66.8% average multiple-choice) is competitive with Gemma2-2B (66.7%) but notably weaker on MMLU (49.2% vs. 53.0%).
+
+## Critique
+
+**No theoretical basis for the power law.** The relationship $\eta_\text{opt} \propto \beta \cdot T^{-0.51}$ is purely empirical. No goodness-of-fit statistics (R², confidence intervals) are reported — validation is visual. The exponent $\approx -0.5$ hints at a connection to noise-scale or gradient variance arguments, but this is not explored.
+
+**Continual learning is claimed but not tested.** The paper motivates the schedule partly through continual-learning advantages (no need to prespecify total steps), but presents zero experiments on mid-training resume, continual pretraining, or domain adaptation.
+
+**No intermediate checkpoint evaluation.** Despite criticizing cosine's poor intermediate checkpoints, the paper never evaluates "anytime" performance — no plots of downstream accuracy at intermediate points during training.
+
+**Unexplained coefficient change.** Section 3 derives $a = 4.6$ empirically; Section 4 deploys $a = 4$ without justification.
+
+**3B baselines are not controlled.** The 3B comparisons are against external models (Qwen, Gemma, SmolLM) with different architectures, data mixtures, and training recipes. This makes it impossible to isolate the scheduler's contribution at the 3B scale.
+
+**Missing details.** The 3B data mixture is described only as "open-source datasets with permissive licenses." No compute budget (GPU hours, FLOPs) is reported. No training loss curves comparing schedulers are shown.
+
+**muP is load-bearing.** The entire framework depends on muP for cross-model-size transfer of the power-law coefficients. Without muP, it is unclear whether the fitted $a$ and $b$ would generalize — but the paper does not ablate this.
+
+## Our replication
+
+We swept `amplitude` $\in [1.0, 5.0]$ (scales peak LR) and `power_law_exp` $\in [-0.8, -0.4]$ ($\alpha$) over 95 runs at 37M scale on C4, training for 2900 steps with the same model architecture and batch size as our cosine baseline ($\text{lr}_\text{base} = 0.0073$, `cosine_learning_rate_final_fraction = 0.1`). Three additional runs at 13M use default power-law hyperparameters.
+
+```{python}
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = "plotly_mimetype+notebook_connected"
+
+EXPERIMENTS_DIR_37M = Path("../clearml_experiments/c4_a100x8x4_37m/power_scheduler")
+BASELINE_DIR_37M = Path("../clearml_experiments/c4_a100x8x4_37m/main")
+EXPERIMENTS_DIR_13M = Path("../clearml_experiments/c4_a100x8x4_13m/power_scheduler")
+BASELINE_DIR_13M = Path("../clearml_experiments/c4_a100x8x4_13m/main")
+
+TRACKED_FIELDS = [
+    ("amplitude", "Amplitude"),
+    ("power_law_exp", "Power_Law_Exp"),
+    ("steps", "Steps"),
+    ("learning_rate", "Learning_Rate"),
+]
+
+SHARED_DEFAULTS = {
+    "steps": 2900,
+}
+
+
+def calculate_ema(data, smoothing=0.97):
+    ema = [data[0]]
+    for value in data[1:]:
+        ema.append(ema[-1] * smoothing + value * (1 - smoothing))
+    return ema
+
+
+def _read_csv(path):
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    return df["step"].tolist(), df["value"].tolist()
+
+
+def _parse_config(metadata):
+    hp = metadata.get("hyperparameters", {})
+    config = {}
+    for key, val in hp.items():
+        if not key.startswith("Hydra/"):
+            continue
+        suffix = key.removeprefix("Hydra/")
+        if suffix.startswith("model."):
+            config[suffix.removeprefix("model.")] = val
+        elif suffix.startswith("training."):
+            config[suffix.removeprefix("training.")] = val
+        elif suffix.startswith("flat_tokens."):
+            config[suffix.removeprefix("flat_tokens.")] = val
+    return config
+
+
+def _load_experiment(exp_dir, metrics_data, config_data, kind="power_scheduler"):
+    metadata = json.loads((exp_dir / "metadata.json").read_text())
+    if metadata["status"] != "completed":
+        return
+    task_id = metadata["experiment_id"]
+    config_data[task_id] = _parse_config(metadata)
+    loss_csv = _read_csv(exp_dir / "metrics" / "loss_loss.csv")
+    if loss_csv is None:
+        return
+    steps, loss = loss_csv
+    name = metadata["experiment_name"]
+    for prefix in ["c4_a100x8x4_37m_", "c4_a100x8x4_13m_", "c4_sp_37m_", "13m_"]:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    metrics_data[task_id] = {
+        "name": name,
+        "steps": steps,
+        "loss": loss,
+        "final_loss": calculate_ema(loss)[-1],
+        "kind": kind,
+    }
+
+
+def get_metrics_data(experiments_dir, baseline_dir=None):
+    metrics_data, config_data = {}, {}
+    if experiments_dir.exists():
+        for exp_dir in sorted(experiments_dir.iterdir()):
+            if exp_dir.is_dir():
+                _load_experiment(exp_dir, metrics_data, config_data, kind="power_scheduler")
+    if baseline_dir is not None and baseline_dir.exists():
+        for exp_dir in sorted(baseline_dir.iterdir()):
+            if exp_dir.is_dir():
+                _load_experiment(exp_dir, metrics_data, config_data, kind="baseline")
+    return metrics_data, config_data
+
+
+def filter_metrics(metrics_data, config_data=None, kinds=None, has_amplitude=None, steps=None):
+    out = {}
+    for guid, d in metrics_data.items():
+        if kinds is not None and d["kind"] not in kinds:
+            continue
+        cfg = (config_data or {}).get(guid, {})
+        if has_amplitude is True and "amplitude" not in cfg:
+            continue
+        if has_amplitude is False and "amplitude" in cfg:
+            continue
+        if steps is not None:
+            run_steps = cfg.get("steps", SHARED_DEFAULTS.get("steps"))
+            if run_steps is not None and int(run_steps) != steps:
+                continue
+        out[guid] = d
+    return out
+
+
+def get_top_k_experiments(loss_data, k=None, ema_smoothing=0.97):
+    sorted_exps = sorted(loss_data.items(), key=lambda x: calculate_ema(x[1]["loss"], smoothing=ema_smoothing)[-1])
+    return dict(sorted_exps[:k] if k else sorted_exps)
+
+
+def plot_loss_data(loss_data, ema_smoothing=0.97, top_k=None, opacity=0.25, title=None):
+    if top_k:
+        loss_data = get_top_k_experiments(loss_data, k=top_k, ema_smoothing=ema_smoothing)
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+               "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    fig = go.Figure()
+    for i, (_, data) in enumerate(loss_data.items()):
+        steps, loss = data["steps"], data["loss"]
+        ema = calculate_ema(loss, smoothing=ema_smoothing)
+        color = palette[i % len(palette)]
+        fig.add_trace(go.Scatter(
+            x=steps, y=loss, mode="lines", name=data["name"],
+            legendgroup=data["name"], showlegend=False,
+            line=dict(color=color, width=1), opacity=opacity, hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=steps, y=ema, mode="lines", name=data["name"],
+            legendgroup=data["name"],
+            line=dict(color=color, width=2),
+            hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.4f}<extra></extra>",
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Steps", yaxis_title="Loss",
+        height=600, hovermode="closest",
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(l=60, r=20, t=40, b=80),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.show()
+
+
+def get_eval_metrics_table(metrics_data, config_data, top_k=None, extra_fields=None):
+    rows = []
+    for guid, d in metrics_data.items():
+        if d["final_loss"] is None:
+            continue
+        fields = {}
+        cfg = config_data.get(guid, {})
+        display_fields = TRACKED_FIELDS if extra_fields is None else TRACKED_FIELDS + extra_fields
+        for config_key, display_key in display_fields:
+            val = cfg.get(config_key)
+            if val is None:
+                val = SHARED_DEFAULTS.get(config_key)
+            if val is not None:
+                try:
+                    fields[display_key] = float(val)
+                except (ValueError, TypeError):
+                    fields[display_key] = val
+        name = d["name"]
+        rows.append({"Name": name if len(name) < 40 else name[:37] + "...", "Final_Loss": float(d["final_loss"]), **fields})
+    df = pd.DataFrame(rows).sort_values("Final_Loss").reset_index(drop=True)
+    if top_k:
+        df = df.head(top_k)
+    return df.style.format(precision=6).set_properties(**{"text-align": "left"})
+
+
+metrics_37m, config_37m = get_metrics_data(EXPERIMENTS_DIR_37M, BASELINE_DIR_37M)
+metrics_13m, config_13m = get_metrics_data(EXPERIMENTS_DIR_13M, BASELINE_DIR_13M)
+```
+
+### Best power-law runs vs. cosine baseline (37M)
+
+All 37M experiments train for 2900 steps on C4 with the same model architecture and batch size. The top 10 power-law runs are plotted against the best cosine baseline.
+
+```{python}
+hpo_runs = filter_metrics(metrics_37m, config_data=config_37m, kinds=("power_scheduler",), has_amplitude=True, steps=2900)
+baselines = filter_metrics(metrics_37m, config_data=config_37m, kinds=("baseline",))
+
+combined = {}
+combined.update(get_top_k_experiments(hpo_runs, k=10))
+combined.update(get_top_k_experiments(baselines, k=1))
+plot_loss_data(combined, ema_smoothing=0.97, opacity=0.1)
+```
+
+```{python}
+get_eval_metrics_table(hpo_runs, config_37m, top_k=10)
+```
+
+### Cosine baselines
+
+The cosine baseline pool contains 23 runs with different learning rate and step count configurations.
+
+```{python}
+get_eval_metrics_table(baselines, config_37m, top_k=10, extra_fields=[("warmup_steps", "Warmup_Steps")])
+```
+
+### Sensitivity to amplitude vs. exponent
+
+The scatter plot maps each of the 95 power-law runs to its EMA-smoothed final loss across the `amplitude` $\in [1.0, 5.0]$ and `power_law_exp` $\in [-0.8, -0.4]$ grid.
+
+```{python}
+import plotly.express as px
+import numpy as np
+
+scatter_rows = []
+for guid, d in hpo_runs.items():
+    cfg = config_37m.get(guid, {})
+    amp = cfg.get("amplitude")
+    exp = cfg.get("power_law_exp")
+    if amp is not None and exp is not None:
+        scatter_rows.append({
+            "amplitude": float(amp),
+            "power_law_exp": float(exp),
+            "final_loss": float(d["final_loss"]),
+            "name": d["name"],
+        })
+
+scatter_df = pd.DataFrame(scatter_rows)
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=scatter_df["amplitude"],
+    y=scatter_df["power_law_exp"],
+    mode="markers",
+    marker=dict(
+        size=10,
+        color=scatter_df["final_loss"],
+        colorscale="Viridis_r",
+        colorbar=dict(title="Final Loss (EMA)"),
+        showscale=True,
+        line=dict(width=0.5, color="white"),
+    ),
+    text=[f"A={r.amplitude:.2f}, exp={r.power_law_exp:.3f}<br>loss={r.final_loss:.4f}" for _, r in scatter_df.iterrows()],
+    hovertemplate="%{text}<extra></extra>",
+))
+
+fig.update_layout(
+    xaxis_title="Amplitude",
+    yaxis_title="Power Law Exponent",
+    height=500,
+    margin=dict(l=60, r=20, t=20, b=60),
+)
+fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+fig.show()
+```
+
+The lowest-loss region is concentrated at `amplitude` $\approx 3.0$ and `power_law_exp` $\approx -0.6$. Amplitude has a stronger effect: runs with amplitude $> 4.5$ hit the learning rate cap at 0.02 and behave identically regardless of exponent, while runs with amplitude $< 2.0$ never reach a high enough peak learning rate.
+
+```{python}
+bins = [(1.0, 2.5, "A < 2.5"), (2.5, 3.5, "2.5 <= A < 3.5"), (3.5, 5.5, "A >= 3.5")]
+
+for lo, hi, label in bins:
+    subset = {}
+    for guid, d in hpo_runs.items():
+        cfg = config_37m.get(guid, {})
+        amp = cfg.get("amplitude")
+        if amp is not None and lo <= float(amp) < hi:
+            subset[guid] = d
+    if subset:
+        best = get_top_k_experiments(subset, k=3)
+        print(f"\n{label}: {len(subset)} runs, best final loss = {min(d['final_loss'] for d in subset.values()):.4f}")
+```
+
+```{python}
+bins_exp = [(-0.85, -0.65, "exp < -0.65"), (-0.65, -0.55, "-0.65 <= exp < -0.55"), (-0.55, -0.35, "exp >= -0.55")]
+
+for lo, hi, label in bins_exp:
+    subset = {}
+    for guid, d in hpo_runs.items():
+        cfg = config_37m.get(guid, {})
+        exp = cfg.get("power_law_exp")
+        if exp is not None and lo <= float(exp) < hi:
+            subset[guid] = d
+    if subset:
+        print(f"{label}: {len(subset)} runs, best final loss = {min(d['final_loss'] for d in subset.values()):.4f}")
+```
+
+### Extended training (5800 and 11600 steps)
+
+A small number of runs train for 5800 or 11600 steps with the power-law schedule.
+
+```{python}
+extended_runs = {}
+for guid, d in metrics_37m.items():
+    cfg = config_37m.get(guid, {})
+    s = cfg.get("steps", SHARED_DEFAULTS.get("steps"))
+    if s is not None and int(s) > 2900 and d["kind"] == "power_scheduler":
+        extended_runs[guid] = d
+
+long_baselines = {}
+for guid, d in baselines.items():
+    cfg = config_37m.get(guid, {})
+    s = cfg.get("steps")
+    if s is not None and int(s) > 2900:
+        long_baselines[guid] = d
+
+combined_extended = {}
+combined_extended.update(extended_runs)
+combined_extended.update(long_baselines)
+
+if combined_extended:
+    plot_loss_data(combined_extended, ema_smoothing=0.97, opacity=0.1)
+    get_eval_metrics_table(combined_extended, config_37m)
+else:
+    print("No extended runs found.")
+```
+
+### Cross-scale comparison (13M)
+
+Three power-law runs at the 13M scale use default hyperparameters (no amplitude/exponent overrides). The 13M baseline uses cosine decay.
+
+```{python}
+ps_13m = filter_metrics(metrics_13m, kinds=("power_scheduler",))
+bl_13m = filter_metrics(metrics_13m, kinds=("baseline",))
+combined_13m = {}
+combined_13m.update(ps_13m)
+combined_13m.update(bl_13m)
+
+if combined_13m:
+    plot_loss_data(combined_13m, ema_smoothing=0.97, opacity=0.1)
+    get_eval_metrics_table(combined_13m, config_13m)
+```
+
+At 13M parameters, the cosine baseline also outperforms the default power-law configuration.
+
+## Assessment
+
+The paper's core empirical observation — that optimal LR scales as $\beta \cdot T^{-0.51}$ — is interesting and the near-$-0.5$ exponent deserves theoretical follow-up. But the practical claims are undersupported:
+
+- The controlled 1B comparison shows a 0.5-point improvement over cosine, well within noise for zero-shot evals. The 3B comparison is uncontrolled (different models, data, training recipes).
+- The headline advantage — no need to specify total steps — is shared with WSD, which performs comparably in their own Table 5.
+- Our 95-run sweep at 37M finds that the best power-law configuration matches but does not beat cosine, consistent with the paper's small margins being within noise at our scale.
+- The claimed continual-learning and anytime-checkpoint benefits are never empirically validated.
+
+The Power Scheduler is a reasonable alternative to cosine decay, but the evidence does not support adopting it over WSD or cosine in practice. The main contribution is the scaling law observation itself, not the schedule.
+
+## Limitations of our replication
+
+- All HPO runs train for 2900 steps. The three extended runs (5800, 11600 steps) do not cover the full amplitude/exponent grid.
+- 37M parameters is below the scale where schedule differences typically become decisive.
+- Runs with `amplitude` $\geq 4.5$ hit a learning rate cap at 0.02, making the amplitude parameter ineffective above that threshold.
+- The 13M power-law runs use default hyperparameters and do not sweep amplitude or exponent.
+- No eval loss or downstream task measurements beyond training loss are available.
+- The power-law schedule [implementation](https://github.com/clankur/muGPT/tree/power_scheduler) follows the paper's Section 4 but lives on a separate branch that is not merged into main.

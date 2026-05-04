@@ -1,0 +1,279 @@
+---
+title: "Shared KV: tying keys and values in multi-head attention"
+---
+
+Standard multi-head attention projects the input into separate queries, keys, and values via $W_Q$, $W_K$, $W_V$. Shared KV eliminates the separate key projection: a single matrix $W_{KV}$ produces a representation that is used as both the value and (after RoPE) the key, halving the KV cache at inference. The modification was tested at 270M and 1B parameter scales on C4 on a v4-32 TPU pod slice.
+
+At 270M, the shared KV run (EMA loss 2.88) underperforms the baseline (2.78), though the runs use different learning rates which confounds the comparison. At 1B with matched learning rate ($3 \times 10^{-4}$), shared KV (2.51) is 0.018 nats behind the standard baseline (2.49). The gap is small relative to the 50% KV cache reduction.
+
+## Architecture
+
+In a standard transformer layer, the KV projection is:
+
+$$k, v = x W_{KV} \quad \text{where } W_{KV} \in \mathbb{R}^{2 \times d_\text{model} \times n_{kv} \times d_\text{head}}$$
+
+The shared KV variant replaces this with:
+
+$$v = x W_{KV} \quad \text{where } W_{KV} \in \mathbb{R}^{d_\text{model} \times n_{kv} \times d_\text{head}}$$
+
+$$k = \text{RoPE}(v)$$
+
+The key is derived from the value by applying rotary position embeddings. At inference, the KV cache stores only one tensor per layer instead of two, halving KV cache memory.
+
+Implementation: [`shared kv implementation`](https://github.com/clankur/seqax/commit/687f75b).
+
+```{python}
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = "plotly_mimetype+notebook_connected"
+
+# 270M experiments
+SHARED_KV_270M_DIR = Path("../clearml_experiments/c4_a100x8x4_270m/shared_kv")
+BASELINE_270M_DIR = Path("../clearml_experiments/c4_a100x8x4_270m/main")
+
+# 1B experiments
+SHARED_KV_1B_DIR = Path("../clearml_experiments/c4_a100x8x4_1b/shared_kv")
+BASELINE_1B_DIR = Path("../clearml_experiments/c4_a100x8x4_1b/main")
+
+TRACKED_FIELDS = [
+    ("learning_rate", "Learning_Rate"),
+    ("d_model", "d_model"),
+    ("n_kv", "n_kv"),
+    ("d_head", "d_head"),
+    ("layers", "Layers"),
+    ("d_ff", "d_ff"),
+]
+
+SHARED_DEFAULTS_270M = {
+    "d_model": 1024,
+    "d_ff": 8192,
+    "n_kv": 16,
+    "d_head": 128,
+    "layers": 8,
+    "learning_rate": 3e-4,
+}
+
+SHARED_DEFAULTS_1B = {
+    "d_model": 2048,
+    "d_ff": 16384,
+    "n_kv": 16,
+    "d_head": 128,
+    "layers": 8,
+    "learning_rate": 3e-4,
+}
+
+
+def calculate_ema(data, smoothing=0.97):
+    ema = [data[0]]
+    for value in data[1:]:
+        ema.append(ema[-1] * smoothing + value * (1 - smoothing))
+    return ema
+
+
+def _read_csv(path):
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    return df["step"].tolist(), df["value"].tolist()
+
+
+def _parse_config(metadata):
+    hp = metadata.get("hyperparameters", {})
+    config = {}
+    for key, val in hp.items():
+        if not key.startswith("Hydra/"):
+            continue
+        suffix = key.removeprefix("Hydra/")
+        if suffix.startswith("model."):
+            config[suffix.removeprefix("model.")] = val
+        elif suffix.startswith("training."):
+            config[suffix.removeprefix("training.")] = val
+    return config
+
+
+def _load_experiment(exp_dir, metrics_data, config_data, kind="shared_kv", defaults=None):
+    metadata = json.loads((exp_dir / "metadata.json").read_text())
+    if metadata.get("status") == "failed":
+        return
+    task_id = metadata["experiment_id"]
+    config_data[task_id] = _parse_config(metadata)
+    loss_csv = _read_csv(exp_dir / "metrics" / "loss_loss.csv")
+    if loss_csv is None:
+        return
+    steps, loss = loss_csv
+    lr_csv = _read_csv(exp_dir / "metrics" / "learning_rate_learning_rate.csv")
+    peak_lr = max(v for v in lr_csv[1]) if lr_csv else None
+    if peak_lr is not None and "learning_rate" not in config_data[task_id]:
+        config_data[task_id]["learning_rate"] = peak_lr
+    name = metadata["experiment_name"]
+    metrics_data[task_id] = {
+        "name": name,
+        "steps": steps,
+        "loss": loss,
+        "final_loss": calculate_ema(loss)[-1],
+        "kind": kind,
+        "peak_lr": peak_lr,
+    }
+
+
+def get_metrics_data(experiment_dirs, baseline_dirs, exp_defaults=None, base_defaults=None):
+    metrics_data, config_data = {}, {}
+    for exp_dir in experiment_dirs:
+        for run_dir in sorted(exp_dir.iterdir()):
+            if run_dir.is_dir():
+                _load_experiment(run_dir, metrics_data, config_data, kind="shared_kv", defaults=exp_defaults)
+    for base_dir in baseline_dirs:
+        for run_dir in sorted(base_dir.iterdir()):
+            if run_dir.is_dir():
+                _load_experiment(run_dir, metrics_data, config_data, kind="baseline", defaults=base_defaults)
+    return metrics_data, config_data
+
+
+def filter_metrics(metrics_data, kinds=None):
+    out = {}
+    for guid, d in metrics_data.items():
+        if kinds is not None and d["kind"] not in kinds:
+            continue
+        out[guid] = d
+    return out
+
+
+def get_top_k_experiments(loss_data, k=None, ema_smoothing=0.97):
+    sorted_exps = sorted(loss_data.items(), key=lambda x: calculate_ema(x[1]["loss"], smoothing=ema_smoothing)[-1])
+    return dict(sorted_exps[:k] if k else sorted_exps)
+
+
+def plot_loss_data(loss_data, ema_smoothing=0.97, top_k=None, opacity=0.25, title=None):
+    if top_k:
+        loss_data = get_top_k_experiments(loss_data, k=top_k, ema_smoothing=ema_smoothing)
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+               "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    fig = go.Figure()
+    for i, (_, data) in enumerate(loss_data.items()):
+        steps, loss = data["steps"], data["loss"]
+        ema = calculate_ema(loss, smoothing=ema_smoothing)
+        color = palette[i % len(palette)]
+        fig.add_trace(go.Scatter(
+            x=steps, y=loss, mode="lines", name=data["name"],
+            legendgroup=data["name"], showlegend=False,
+            line=dict(color=color, width=1), opacity=opacity, hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=steps, y=ema, mode="lines", name=data["name"],
+            legendgroup=data["name"],
+            line=dict(color=color, width=2),
+            hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.4f}<extra></extra>",
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Steps", yaxis_title="Loss",
+        height=600, hovermode="closest",
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(l=60, r=20, t=40, b=80),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.1)")
+    fig.show()
+
+
+def get_eval_metrics_table(metrics_data, config_data, defaults=None, top_k=None):
+    if defaults is None:
+        defaults = {}
+    rows = []
+    for guid, d in metrics_data.items():
+        if d["final_loss"] is None:
+            continue
+        fields = {}
+        cfg = config_data[guid]
+        for config_key, display_key in TRACKED_FIELDS:
+            val = cfg.get(config_key)
+            if val is None:
+                val = defaults.get(config_key)
+            if val is None:
+                continue
+            if config_key == "learning_rate":
+                fields[display_key] = f"{float(val):.1e}"
+            else:
+                fields[display_key] = int(val) if isinstance(val, (int, float)) else val
+        name = d["name"]
+        rows.append({
+            "Name": name,
+            "Kind": d["kind"],
+            "Final Loss (EMA)": round(float(d["final_loss"]), 4),
+            "Steps": max(d["steps"]),
+            **fields,
+        })
+    df = pd.DataFrame(rows).sort_values("Final Loss (EMA)").reset_index(drop=True)
+    if top_k:
+        df = df.head(top_k)
+    return df.style.format(precision=4).set_properties(**{"text-align": "left"})
+
+
+# Load all data
+metrics_270m, config_270m = get_metrics_data(
+    [SHARED_KV_270M_DIR], [BASELINE_270M_DIR],
+    exp_defaults=SHARED_DEFAULTS_270M, base_defaults=SHARED_DEFAULTS_270M,
+)
+metrics_1b, config_1b = get_metrics_data(
+    [SHARED_KV_1B_DIR], [BASELINE_1B_DIR],
+    exp_defaults=SHARED_DEFAULTS_1B, base_defaults=SHARED_DEFAULTS_1B,
+)
+```
+
+## 270M: shared KV vs baselines
+
+One shared KV run and one baseline were trained at 270M on C4 for 23,000 steps. Four shared KV seed variants produced identical loss curves (flat-tokens loader is deterministic); only one is shown.
+
+`c4_sp_270m` (standard parametrization, lr $8.1 \times 10^{-4}$) is the baseline. The shared KV run uses lr $3 \times 10^{-4}$. The learning rate difference confounds the 270M comparison.
+
+```{python}
+completed_270m = filter_metrics(metrics_270m, kinds=("shared_kv", "baseline"))
+
+shared_kv_ids = [gid for gid, d in completed_270m.items() if d["kind"] == "shared_kv"]
+baseline_ids = [gid for gid, d in completed_270m.items() if d["kind"] == "baseline"]
+representative_270m = {shared_kv_ids[0]: completed_270m[shared_kv_ids[0]]}
+representative_270m.update({gid: completed_270m[gid] for gid in baseline_ids})
+plot_loss_data(representative_270m, ema_smoothing=0.97, opacity=0.1, title="270M: Shared KV vs Baselines")
+```
+
+```{python}
+get_eval_metrics_table(representative_270m, config_270m, defaults=SHARED_DEFAULTS_270M)
+```
+
+## 1B: shared KV vs baselines
+
+One shared KV run and one baseline were trained at 1B on C4 for 92,500 steps. Both use learning rate $3 \times 10^{-4}$ under standard parametrization.
+
+```{python}
+completed_1b = filter_metrics(metrics_1b, kinds=("shared_kv", "baseline"))
+plot_loss_data(completed_1b, ema_smoothing=0.97, opacity=0.1, title="1B: Shared KV vs Baselines")
+```
+
+```{python}
+get_eval_metrics_table(completed_1b, config_1b, defaults=SHARED_DEFAULTS_1B)
+```
+
+
+## Summary
+
+| Scale | Variant | LR | Final EMA Loss | Steps |
+|---|---|---|---|---|
+| 270M | shared_kv | $3 \times 10^{-4}$ | 2.88 | 22,995 |
+| 270M | c4_sp_270m (baseline) | $8.1 \times 10^{-4}$ | 2.78 | 22,995 |
+| 1B | c4_a100x8x4_1b_sp (baseline) | $3 \times 10^{-4}$ | 2.49 | 92,492 |
+| 1B | c4_a100x8x4_1b_shared_kv | $3 \times 10^{-4}$ | 2.51 | 92,492 |
+
+At 1B with matched learning rate, shared KV is 0.018 nats behind the standard baseline while using 50% fewer KV projection parameters and halving KV cache memory. Whether this trade-off is worthwhile depends on the application's sensitivity to loss degradation vs. inference memory constraints.
+
+## Limitations
+
+- The 270M comparison is confounded by learning rate differences. No 270M baseline at $\text{lr} = 3 \times 10^{-4}$ with standard K/V projections exists.
+- Only one shared KV run exists at 1B.
+- No eval loss, perplexity, or downstream task metrics were recorded. All comparisons use training loss only.
+- No inference latency or KV cache memory measurements were taken.

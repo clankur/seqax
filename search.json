@@ -261,7 +261,7 @@
   {
     "objectID": "index.html",
     "href": "index.html",
-    "title": "Pretrainings experiment reports",
+    "title": "Pretraining experiment reports",
     "section": "",
     "text": "Experiment reports from seqax, a small LLM pretraining codebase in JAX.\n\n\n\nReport\nSummary\n\n\n\n\nShared KV\nTying keys and values in multi-head attention — tested at 270M and 1B on C4\n\n\nPosition Embeddings\nCoPE vs ALiBi vs RoPE at 31M scale\n\n\nPower Scheduler\n95-run HPO sweep of the power-law LR schedule vs cosine at 37M\n\n\nLCM\nJointly-trained Large Concept Model for KV cache compression at 31M"
   },

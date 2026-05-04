@@ -1,5 +1,5 @@
 ---
-title: "seqax experiment reports"
+title: "Pretraining experiment reports"
 ---
 
 Experiment reports from [seqax](https://github.com/clankur/seqax), a small LLM pretraining codebase in JAX.

@@ -165,3 +165,9 @@ cython_debug/
 # wandb
 wandb/
 clearml_experiments**
+
+# Quarto
+docs/*.html
+docs/*_files/
+docs/.quarto/
+_site/

@@ -3,7 +3,7 @@ project:
   output-dir: _site
 
 website:
-  title: "seqax"
+  title: "experiments"
   navbar:
     left:
       - text: "Home"
@@ -17,8 +17,11 @@ website:
       - text: "LCM"
         href: lcm.qmd
 
+
 format:
   html:
-    theme: united
     toc: true
     code-fold: true
+    theme:
+      light: cosmo
+      dark: [cosmo, theme-dark.scss]

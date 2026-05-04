@@ -239,10 +239,6 @@ To cite this repository:
 
 ## Acknowledgements
 
-seqax's implementation style was substantially inspired by [jaxtyping](https://docs.kidger.site/jaxtyping/), [einops](https://einops.rocks/), [equinox](https://docs.kidger.site/equinox/), and [shard_map](https://jax.readthedocs.io/en/latest/jep/14273-shard-map.html).
+Thanks to the [MatX team](https://matx.com/) for their implementation of GPT in seqax which I used to implement many of my experiments.
 
-Thanks to [MaxText](https://github.com/google/maxtext) for demonstrating good practices for production LLM use of JAX.
-
-Thanks to the [JAX](https://github.com/google/jax) team for ongoing support and advice.
-
-Thanks to the [Google TPU Research Cloud](https://sites.research.google/trc/about/), which partially supported this work.
+Thanks to the [Google TPU Research Cloud](https://sites.research.google/trc/about/), which has supported my investigations.

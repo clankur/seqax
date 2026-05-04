@@ -39,7 +39,7 @@
     "href": "shared_kv.html#limitations",
     "title": "Shared KV: tying keys and values in multi-head attention",
     "section": "Limitations",
-    "text": "Limitations\n\nAll baselines use MHA (n_kv=16, n_q_per_kv=1). No comparison against GQA or MQA, which also reduce KV cache.\nOnly one shared KV run exists at each scale.\nLearning rate (\\(3 \\times 10^{-4}\\)) is the untuned default from c4_a100x8_base.yaml. A tuned LR may shift the gap in either direction.\nNo eval loss, perplexity, or downstream task metrics were recorded. All comparisons use training loss only.\nNo inference latency or KV cache memory measurements were taken."
+    "text": "Limitations\n\nAll baselines use MHA (n_kv=16, n_q_per_kv=1). No comparison against GQA or MQA, which also reduce KV cache.\nOnly one shared KV run exists at each scale.\nNo eval loss, perplexity, or downstream task metrics were recorded. All comparisons use training loss only.\nNo inference latency or KV cache memory measurements were taken."
   },
   {
     "objectID": "shared_kv.html#next-experiments",
@@ -151,7 +151,7 @@
     "href": "position_embeddings.html#limitations",
     "title": "Position embeddings: CoPE vs ALiBi vs RoPE",
     "section": "Limitations",
-    "text": "Limitations\n\n31M parameters only. Results may differ at larger scales where long-range dependencies matter more.\nContext lengths are 512–1024 tokens. ALiBi and CoPE target length generalization, which is not tested here.\nCross-dataset comparisons are approximate. Only within-dataset comparisons at the same LR and step count are controlled.\nNo inference latency, memory, or length-generalization measurements were taken."
+    "text": "Limitations\n\n31M parameters only. Results may differ at larger scales where long-range dependencies matter more.\nContext lengths are 1024 tokens. ALiBi and CoPE target length generalization, which is not tested here.\nCross-dataset comparisons are approximate. Only within-dataset comparisons at the same LR and step count are controlled.\nNo inference latency, memory, or length-generalization measurements were taken."
   },
   {
     "objectID": "power_scheduler.html",
@@ -193,7 +193,7 @@
     "href": "power_scheduler.html#limitations-of-our-replication",
     "title": "Review: Power Scheduler (Shen et al., 2024)",
     "section": "Limitations of our replication",
-    "text": "Limitations of our replication\n\nAll HPO runs train for 2900 steps. The three extended runs (5800, 11600 steps) do not cover the full amplitude/exponent grid.\n37M parameters is below the scale where schedule differences typically become decisive.\nRuns with amplitude \\(\\geq 4.5\\) hit a learning rate cap at 0.02, making the amplitude parameter ineffective above that threshold.\nThe 13M power-law runs use default hyperparameters and do not sweep amplitude or exponent.\nNo eval loss or downstream task measurements beyond training loss are available.\nThe power-law schedule implementation follows the paper’s Section 4 but lives on a separate branch that is not merged into main."
+    "text": "Limitations of our replication\n\nAll HPO runs train for 2900 steps. The three extended runs (5800, 11600 steps) do not cover the full amplitude/exponent grid.\n37M parameters is below the scale where schedule differences typically become decisive.\nRuns with amplitude \\(\\geq 4.5\\) hit a learning rate cap at 0.02, making the amplitude parameter ineffective above that threshold.\nThe 13M power-law runs use default hyperparameters and do not sweep amplitude or exponent.\nNo eval loss or downstream task measurements beyond training loss are available."
   },
   {
     "objectID": "lcm.html",

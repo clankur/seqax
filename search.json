@@ -263,7 +263,14 @@
     "href": "index.html",
     "title": "Pretraining experiment reports",
     "section": "",
-    "text": "Experiment reports from seqax, a small LLM pretraining codebase in JAX.\n\n\n\nReport\nSummary\n\n\n\n\nShared KV\nTying keys and values in multi-head attention — tested at 270M and 1B on C4\n\n\nPosition Embeddings\nCoPE vs ALiBi vs RoPE at 31M scale\n\n\nPower Scheduler\n95-run HPO sweep of the power-law LR schedule vs cosine at 37M\n\n\nLCM\nJointly-trained Large Concept Model for KV cache compression at 31M"
+    "text": "Experiment reports from seqax, a small LLM pretraining codebase in JAX."
+  },
+  {
+    "objectID": "index.html#acknowledgements",
+    "href": "index.html#acknowledgements",
+    "title": "Pretraining experiment reports",
+    "section": "Acknowledgements",
+    "text": "Acknowledgements\nThanks to the MatX team for their implementation of GPT in seqax which I used as a base to implement all my experiments.\nThanks to the Google TPU Research Cloud, which has supported my investigations."
   },
   {
     "objectID": "flat-tokens.html",

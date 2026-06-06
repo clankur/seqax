@@ -16,11 +16,11 @@ import einops
 import hydra
 import jax
 import jax.numpy as jnp
-from clearml import Task
 from jax import lax
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.tree_util import tree_leaves
+from runq import Client, Task
 from typeguard import typechecked
 
 import jax_extra
@@ -449,8 +449,8 @@ class Config:
         return self.flat_tokens or self.hf_dataset
 
 
-def main_contained(config, logger, wandb_run=None):
-    """Main program, which does not access external services except as specified by config.paths or logger."""
+def main_contained(config, wandb_run=None):
+    """Main program, which does not access external services except as specified by config.paths."""
     # Use partitionable (and hopefully fusable!) RNG.
     #
     # This is slower in compute time than 'unsafe_rbg' with flag '--xla_tpu_spmd_rng_bit_generator_unsafe=true',
@@ -507,26 +507,26 @@ def main_contained(config, logger, wandb_run=None):
                     f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
                 )
 
-            training_io.log(step, logger, output, wandb_run=wandb_run)
+            training_io.log(step, output, wandb_run=wandb_run)
 
 
 @hydra.main(config_path="configs", version_base=None)
 def main(config):
     config = jax_extra.make_dataclass_from_dict(Config, config)
     if config.training.queue:
-        task = Task.init(project_name="testing", task_name=config.paths.model_name)
-        logger = task.get_logger()
-        task.execute_remotely(queue_name=config.training.queue)
-        task.launch_multi_node(config.num_hosts, wait=True)
-        if int(os.environ["RANK"]) > 0:
-            task.set_system_tags((task.get_system_tags() or []) + ["hidden"])
-        jax.distributed.initialize(
-            os.environ["MASTER_ADDR"] + ":" + os.environ["MASTER_PORT"],
-            num_processes=int(os.environ["WORLD_SIZE"]),
-            process_id=int(os.environ["RANK"]),
-        )
-    else:
-        logger = None
+        # Offload to the runq queue. Locally this captures git context, submits, and exits;
+        # on the worker (RUNQ_EXPERIMENT_ID set) it is a no-op and execution continues below.
+        task = Task(project="seqax", name=config.paths.model_name)
+        task.execute_remotely(queue=config.training.queue)
+
+        # runq runs a single command per worker and does not set up multi-host coordination, so only
+        # task.launch_multi_node(config.num_hosts, wait=True)
+        # if "MASTER_ADDR" in os.environ:
+        #     jax.distributed.initialize(
+        #         os.environ["MASTER_ADDR"] + ":" + os.environ["MASTER_PORT"],
+        #         num_processes=int(os.environ["WORLD_SIZE"]),
+        #         process_id=int(os.environ["RANK"]),
+        #     )
     wandb_run = None
     if config.wandb_project:
         import wandb
@@ -553,7 +553,10 @@ def main(config):
                 },
             },
         )
-    main_contained(config, logger, wandb_run=wandb_run)
+        # When running on a runq worker, link the wandb dashboard back to the runq experiment.
+        if "RUNQ_EXPERIMENT_ID" in os.environ:
+            Client().set_wandb_url(int(os.environ["RUNQ_EXPERIMENT_ID"]), wandb_run.url)
+    main_contained(config, wandb_run=wandb_run)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import jax.profiler
 import numpy as np
+import wandb
 import zarr
 from jax.experimental import multihost_utils
 from jax.lib import xla_client
@@ -35,29 +36,26 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger, output: PyTree, wandb_run=None):
+def log(step: int, output: PyTree, wandb_run=None):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays.
 
     Args:
-        logger: ClearML Logger instance, or None.
         wandb_run: wandb Run instance, or None.
     """
     if jax.process_index() == 0:
-        metrics_dict = {}
+        metrics_dict = {}  # scalars; also printed to stdout
+        histograms = {}  # non-scalar f32 arrays, logged to wandb only
         for path, arr in jax.tree_util.tree_leaves_with_path(output):
             path = jax.tree_util.keystr(path)
             arr = jax.device_get(arr)
             if arr.shape == () and arr.dtype == jnp.float32:
-                if logger:
-                    logger.report_scalar(title=path, series=path, value=arr, iteration=step)
                 metrics_dict[path] = float(arr)
             elif arr.dtype == jnp.float32:
-                if logger:
-                    logger.report_histogram(title=path, series=path, values=arr, iteration=step)
+                histograms[path] = wandb.Histogram(arr)
             else:
                 raise ValueError(f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}.")
         if wandb_run is not None:
-            wandb_run.log(metrics_dict, step=step)
+            wandb_run.log({**metrics_dict, **histograms}, step=step)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] Step {step}: {metrics_dict}")
 

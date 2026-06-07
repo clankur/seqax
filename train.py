@@ -24,6 +24,9 @@ from jax.tree_util import tree_leaves
 from typeguard import typechecked
 
 import jax_extra
+from shardlib.quantops import (
+    FP8_E4M3
+)
 import shardlib.shardops as shardops
 import shardlib.shardtypes as shardtypes
 import training_io
@@ -165,10 +168,14 @@ class Model:
 
             # Attention, using Grouped Query Attention and RoPE position embeddings.
             w_q = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_q))
-            q = save_for_backward(shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q))
+            q = save_for_backward(
+                shardops.einsum_unreduced("B/d L M, M Q K/t D -> B/d L Q K/t D", nx, w_q, quant=FP8_E4M3)
+            )
             q = rope_table.apply("L D -> 1 L 1 1 D", q)
             w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
-            k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv)
+            k, v = shardops.einsum_unreduced(
+                "B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv, quant=FP8_E4M3
+            )
             k = save_for_backward(k)
             v = save_for_backward(v)
             k = rope_table.apply("L d -> 1 L 1 d", k)
@@ -187,7 +194,9 @@ class Model:
                     "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
                 )
             w_o = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
-            attn_out = shardops.einsum_unreduced("B/d Qlen Q K/t D, M Q K/t D -> B/d Qlen M", attn_out, w_o)
+            attn_out = shardops.einsum_unreduced(
+                "B/d Qlen Q K/t D, M Q K/t D -> B/d Qlen M", attn_out, w_o, quant=FP8_E4M3
+            )
             attn_out = shardops.psum_scatter("B/d Qlen M -> B/d Qlen M/t", attn_out)
             x = save_for_backward(x + attn_out)
 
@@ -198,12 +207,16 @@ class Model:
 
             # FFN, using SwiGLU
             w_gate = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_gate))
-            gate_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_gate))
+            gate_proj = save_for_backward(
+                shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_gate, quant=FP8_E4M3)
+            )
             w_up = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_up))
-            up_proj = save_for_backward(shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_up))
+            up_proj = save_for_backward(
+                shardops.einsum_unreduced("B/d L M, M F/t -> B/d L F/t", nx, w_up, quant=FP8_E4M3)
+            )
             y = jax.nn.swish(gate_proj) * up_proj
             w_down = shardops.all_gather("M/d F/t -> M F/t", jnp.bfloat16(layer_weights.w_down))
-            ffn_out = shardops.einsum_unreduced("B/d L F/t, M F/t -> B/d L M", y, w_down)
+            ffn_out = shardops.einsum_unreduced("B/d L F/t, M F/t -> B/d L M", y, w_down, quant=FP8_E4M3)
             ffn_out = shardops.psum_scatter("B/d L M -> B/d L M/t", ffn_out)
 
             return jnp.bfloat16(x + ffn_out), ()

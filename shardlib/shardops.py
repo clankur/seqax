@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+import shardlib.quantops as quantops
 import shardlib.shardtypes as shardtypes
 
 
@@ -49,7 +50,7 @@ def psum_scatter(spec: str, x):
     return x
 
 
-def einsum_unreduced(spec: str, x, y, **kwargs):
+def einsum_unreduced(spec: str, x, y, *, quant=None, **kwargs):
     """Ordinary chip-local einsum, but with sharding-aware typechecking.
 
     Note that this function does not do any chip-to-chip communication. If the inputs are
@@ -60,6 +61,10 @@ def einsum_unreduced(spec: str, x, y, **kwargs):
       # c still needs to be reduced over the y axis.
       d = psum_scatter('A/x/z -> A/x/z/y', c)
       # Now the post-einsum reduction is complete.
+
+    Pass a `quant` (a quantops.QuantFormat, e.g. quantops.FP8_E4M3) to run the matmul in low
+    precision -- a real fp8/int forward GEMM with a bf16 straight-through backward. quant=None is
+    the ordinary bf16 einsum.
     """
     tmp, result = spec.split("->")
     lhs, rhs = tmp.split(",")
@@ -94,7 +99,7 @@ def einsum_unreduced(spec: str, x, y, **kwargs):
     jaxspec += "->"
     for dim in result.dims:
         jaxspec += map_var(dim)
-    r = jnp.einsum(jaxspec, x, y, **kwargs)
+    r = quantops.quantized_einsum(jaxspec, quant, x, y) if quant is not None else jnp.einsum(jaxspec, x, y, **kwargs)
     shardtypes.check(r.dtype, result, r)
     return r
 

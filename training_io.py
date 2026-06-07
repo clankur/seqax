@@ -18,12 +18,11 @@ import jax
 import jax.numpy as jnp
 import jax.profiler
 import numpy as np
+import wandb
 import zarr
 from jax.experimental import multihost_utils
 from jax.lib import xla_client
 from numcodecs import blosc
-
-import wandb
 
 PyTree = Any
 

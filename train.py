@@ -28,7 +28,14 @@ import shardlib.shardops as shardops
 import shardlib.shardtypes as shardtypes
 import training_io
 from flash_attention import attention as flash_attention_fn
-from input_loader import FlatTokensParams, HuggingFaceDataParams, TokenBatch, TokenBatchParams, get_loader
+from input_loader import (
+    FlatTokensParams,
+    HuggingFaceDataParams,
+    LongCrawl64Params,
+    TokenBatch,
+    TokenBatchParams,
+    get_loader,
+)
 from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
 from shardlib.shardtypes import Array, bf16, bool_, f32, make_shardings, pytree_dataclass, u32
 
@@ -434,19 +441,17 @@ class Config:
     io: training_io.IOConfig
     flat_tokens: Optional[FlatTokensParams] = None
     hf_dataset: Optional[HuggingFaceDataParams] = None
+    longcrawl: Optional[LongCrawl64Params] = None
     wandb_project: Optional[str] = None
 
     def __post_init__(self):
-        assert self.flat_tokens is not None or self.hf_dataset is not None, (
-            "Must provide either flat_tokens or hf_dataset."
-        )
-        assert not (self.flat_tokens is not None and self.hf_dataset is not None), (
-            "Should not specify both flat_tokens and hf_dataset."
-        )
+        sources = [self.flat_tokens, self.hf_dataset, self.longcrawl]
+        provided = [s for s in sources if s is not None]
+        assert len(provided) == 1, "Must provide exactly one of flat_tokens, hf_dataset, or longcrawl."
 
     @cached_property
-    def training_data(self) -> Union[FlatTokensParams, HuggingFaceDataParams]:
-        return self.flat_tokens or self.hf_dataset
+    def training_data(self) -> Union[FlatTokensParams, HuggingFaceDataParams, LongCrawl64Params]:
+        return self.flat_tokens or self.hf_dataset or self.longcrawl
 
 
 def main_contained(config, logger, wandb_run=None):

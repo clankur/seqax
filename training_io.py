@@ -240,6 +240,11 @@ def fsspec_put(local_src: str, remote_dst: str):
 
 def save_hlo_svg(filespec: str, compiled: jax.stages.Compiled):
     """Saves a compiled function's HLO to an SVG file."""
+    # The SVG is a diagnostic, not part of training -- skip it (rather than crash) when the graphviz
+    # `dot` binary isn't installed, e.g. on a bare GPU worker.
+    if shutil.which("dot") is None:
+        print(f"graphviz 'dot' not found; skipping HLO SVG dump to {filespec}")
+        return
     compiled_hlo_dot = xla_client._xla.hlo_module_to_dot_graph(compiled.runtime_executable().hlo_modules()[0])
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "hlo.dot"), "w") as f:

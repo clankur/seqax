@@ -16,17 +16,16 @@ import einops
 import hydra
 import jax
 import jax.numpy as jnp
+from hydra.core.hydra_config import HydraConfig
 from jax import lax
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.tree_util import tree_leaves
+from omegaconf import OmegaConf
 from runq import Client, Task
 from typeguard import typechecked
 
 import jax_extra
-from shardlib.quantops import (
-    FP8_E4M3
-)
 import shardlib.shardops as shardops
 import shardlib.shardtypes as shardtypes
 import training_io
@@ -40,6 +39,7 @@ from input_loader import (
     get_loader,
 )
 from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
+from shardlib.quantops import FP8_E4M3
 from shardlib.shardtypes import Array, bf16, bool_, f32, make_shardings, pytree_dataclass, u32
 
 shardtypes.register_with_typeguard()
@@ -180,9 +180,7 @@ class Model:
             )
             q = rope_table.apply("L D -> 1 L 1 1 D", q)
             w_kv = shardops.all_gather("2 M/d K/t D -> 2 M K/t D", jnp.bfloat16(layer_weights.w_kv))
-            k, v = shardops.einsum_unreduced(
-                "B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv, quant=FP8_E4M3
-            )
+            k, v = shardops.einsum_unreduced("B/d L M, k_v M K/t D -> k_v B/d L K/t D", nx, w_kv, quant=FP8_E4M3)
             k = save_for_backward(k)
             v = save_for_backward(v)
             k = rope_table.apply("L d -> 1 L 1 d", k)
@@ -530,12 +528,17 @@ def main_contained(config, wandb_run=None):
 
 @hydra.main(config_path="configs", version_base=None)
 def main(config):
+    # Capture the resolved config + CLI overrides while we still have the OmegaConf object (the next
+    # line converts it to a dataclass), so runq can record what the run used -- otherwise its
+    # dashboard config/overrides fields stay empty.
+    config_yaml = OmegaConf.to_yaml(config, resolve=True)
+    overrides = list(HydraConfig.get().overrides.task)
     config = jax_extra.make_dataclass_from_dict(Config, config)
     if config.training.queue:
         # Offload to the runq queue. Locally this captures git context, submits, and exits;
         # on the worker (RUNQ_EXPERIMENT_ID set) it is a no-op and execution continues below.
         task = Task(project="seqax", name=config.paths.model_name)
-        task.execute_remotely(queue=config.training.queue)
+        task.execute_remotely(queue=config.training.queue, config=config_yaml, overrides=overrides)
 
         # runq runs a single command per worker and does not set up multi-host coordination, so only
         # task.launch_multi_node(config.num_hosts, wait=True)

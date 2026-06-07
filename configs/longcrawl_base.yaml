@@ -37,3 +37,5 @@ mesh:
 
 io:
   max_io_threads: 1024
+
+wandb_project: seqax

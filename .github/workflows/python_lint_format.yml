@@ -26,11 +26,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # Lint
+    # Lint. Pin the ruff version explicitly so CI is deterministic (requirements-cpu.txt
+    # has no ruff pin, so version-file silently fell back to "latest").
     - uses: astral-sh/ruff-action@v3.4.0
       with:
-        version-file: 'requirements-cpu.txt'
+        version: "0.15.16"
+        args: check
 
-    # Format
-    - run: ruff format --check
+    # Format (same pinned version)
+    - uses: astral-sh/ruff-action@v3.4.0
+      with:
+        version: "0.15.16"
+        args: format --check
 

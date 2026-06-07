@@ -26,7 +26,7 @@ INT8 = QuantFormat(jnp.int8, 127.0, jnp.int32, integer=True)
 INT4 = QuantFormat(jnp.int4, 7.0, jnp.int32, integer=True)
 
 
-def _quantize(x, fmt: QuantFormat):
+def _quantize(x: jax.Array, fmt: QuantFormat) -> tuple[jax.Array, jax.Array]:
     """Per-tensor "current" amax scaling into `fmt`. Returns (low-precision x, f32 scale)."""
     scale = jnp.maximum(jnp.max(jnp.abs(jnp.float32(x))) / fmt.maxval, 1e-12)
     z = jnp.clip(jnp.float32(x) / scale, -fmt.maxval, fmt.maxval)  # clamp keeps values in range (no NaN/wrap)
@@ -41,22 +41,26 @@ def _quantize(x, fmt: QuantFormat):
 # lacks) run emulated -- correct numerics, no speedup. The backward is format-independent (bf16
 # straight-through), so only the forward reads `fmt`.
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
-def quantized_einsum(jaxspec: str, fmt: QuantFormat, x, y):
-    return _quantized_einsum_fwd(jaxspec, fmt, x, y)[0]
+def quantized_einsum(spec: str, fmt: QuantFormat, x: jax.Array, y: jax.Array) -> jax.Array:
+    return _quantized_einsum_fwd(spec, fmt, x, y)[0]
 
 
-def _quantized_einsum_fwd(jaxspec, fmt, x, y):
+def _quantized_einsum_fwd(
+    spec: str, fmt: QuantFormat, x: jax.Array, y: jax.Array
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
     xq, sx = _quantize(x, fmt)
     yq, sy = _quantize(y, fmt)
-    acc = jnp.einsum(jaxspec, xq, yq, preferred_element_type=fmt.accum)  # f32/int32 accumulate
+    acc = jnp.einsum(spec, xq, yq, preferred_element_type=fmt.accum)  # f32/int32 accumulate
     return jnp.bfloat16(jnp.float32(acc) * sx * sy), (x, y)
 
 
-def _quantized_einsum_bwd(jaxspec, fmt, res, g):
+def _quantized_einsum_bwd(
+    spec: str, fmt: QuantFormat, res: tuple[jax.Array, jax.Array], g: jax.Array
+) -> tuple[jax.Array, jax.Array]:
     # Straight-through bf16. The vjp of an einsum "lhs,rhs->out" is two more einsums with the index
     # letters rearranged: dx = einsum("out,rhs->lhs", g, y), dy = einsum("lhs,out->rhs", x, g).
     x, y = res
-    lhs, rhs_out = jaxspec.split(",")
+    lhs, rhs_out = spec.split(",")
     rhs, out = rhs_out.split("->")
     g = jnp.bfloat16(g)
     dx = jnp.einsum(f"{out},{rhs}->{lhs}", g, y)

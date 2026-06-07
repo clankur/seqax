@@ -3332,7 +3332,7 @@ wheels = [
 [[package]]
 name = "runq"
 version = "0.1.0"
-source = { git = "https://github.com/clankur/runq.git#b707cdc2d2bf24f93a7d1c9e4af25a9fcc2a2365" }
+source = { git = "ssh://git@github.com/clankur/runq.git#eb3a4de7edbacc2841e1ad357a56b7c104182fc4" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
@@ -3499,7 +3499,7 @@ requires-dist = [
     { name = "jaxlib", marker = "extra == 'tpu'", specifier = "==0.4.30" },
     { name = "jupyter" },
     { name = "libtpu-nightly", marker = "extra == 'tpu'", specifier = "==0.1.dev20240617", index = "https://storage.googleapis.com/jax-releases/libtpu_releases.html" },
-    { name = "runq", git = "https://github.com/clankur/runq.git" },
+    { name = "runq", git = "ssh://git@github.com/clankur/runq.git" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers" },
     { name = "typeguard", specifier = "==4.1.5" },

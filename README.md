@@ -69,11 +69,7 @@ Flash attention uses custom Pallas kernels ([`flash_attention.py`](/flash_attent
 
 ### Logging to Weights & Biases
 
-To log metrics to [Weights & Biases](https://wandb.ai), add `+wandb_project=<project_name>`:
-
-```
-XLA_FLAGS=--xla_force_host_platform_device_count=8 uv run python -m train --config-name=local_test_synthetic +paths.model_name=synthetic_000 +wandb_project=seqax
-```
+Every run logs metrics to [Weights & Biases](https://wandb.ai) under the `seqax` project. Make sure you're logged in (`wandb login`) before training.
 
 ### Run on GPUs
 

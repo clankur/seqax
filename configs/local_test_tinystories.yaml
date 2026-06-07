@@ -2,9 +2,6 @@
 #
 # Run on CPU:
 #   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_tinystories +paths.model_name=tinystories_000
-#
-# With Weights & Biases logging:
-#   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_tinystories +paths.model_name=tinystories_000 +wandb_project=seqax
 
 defaults:
 - base

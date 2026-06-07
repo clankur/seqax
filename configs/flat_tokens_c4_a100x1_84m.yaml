@@ -36,7 +36,7 @@ model:
 
 paths:
   # can also be a path to GCS. IE 'gcs://your_bucket/your_output_path' 
-   root_working_dir: '~/seqax_outputs'
+  root_working_dir: '~/seqax_outputs'
 
 num_hosts: 1
 

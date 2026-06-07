@@ -16,6 +16,7 @@ import einops
 import hydra
 import jax
 import jax.numpy as jnp
+import wandb
 from hydra.core.hydra_config import HydraConfig
 from jax import lax
 from jax.experimental import mesh_utils
@@ -44,6 +45,8 @@ from shardlib.shardtypes import Array, bf16, bool_, f32, make_shardings, pytree_
 
 shardtypes.register_with_typeguard()
 PRNGKey = Any
+
+PROJECT_NAME = "seqax"
 
 
 @dataclass(frozen=True)
@@ -453,7 +456,6 @@ class Config:
     flat_tokens: Optional[FlatTokensParams] = None
     hf_dataset: Optional[HuggingFaceDataParams] = None
     longcrawl: Optional[LongCrawl64Params] = None
-    wandb_project: Optional[str] = None
 
     def __post_init__(self):
         sources = [self.flat_tokens, self.hf_dataset, self.longcrawl]
@@ -537,7 +539,7 @@ def main(config):
     if config.training.queue:
         # Offload to the runq queue. Locally this captures git context, submits, and exits;
         # on the worker (RUNQ_EXPERIMENT_ID set) it is a no-op and execution continues below.
-        task = Task(project="seqax", name=config.paths.model_name)
+        task = Task(project=PROJECT_NAME, name=config.paths.model_name)
         task.execute_remotely(queue=config.training.queue, config=config_yaml, overrides=overrides)
 
         # runq runs a single command per worker and does not set up multi-host coordination, so only
@@ -548,35 +550,31 @@ def main(config):
         #         num_processes=int(os.environ["WORLD_SIZE"]),
         #         process_id=int(os.environ["RANK"]),
         #     )
-    wandb_run = None
-    if config.wandb_project:
-        import wandb
-
-        wandb_run = wandb.init(
-            project=config.wandb_project,
-            name=config.paths.model_name,
-            config={
-                "model": {
-                    "d_model": config.model.d_model,
-                    "n_q_per_kv": config.model.n_q_per_kv,
-                    "n_kv": config.model.n_kv,
-                    "d_head": config.model.d_head,
-                    "layers": config.model.layers,
-                    "vocab": config.model.vocab,
-                    "d_ff": config.model.d_ff,
-                },
-                "training": {
-                    "learning_rate": config.training.learning_rate,
-                    "warmup_steps": config.training.warmup_steps,
-                    "steps": config.training.steps,
-                    "batch_size": config.training.tokens.batch,
-                    "seq_len": config.training.tokens.len,
-                },
+    wandb_run = wandb.init(
+        project=PROJECT_NAME,
+        name=config.paths.model_name,
+        config={
+            "model": {
+                "d_model": config.model.d_model,
+                "n_q_per_kv": config.model.n_q_per_kv,
+                "n_kv": config.model.n_kv,
+                "d_head": config.model.d_head,
+                "layers": config.model.layers,
+                "vocab": config.model.vocab,
+                "d_ff": config.model.d_ff,
             },
-        )
-        # When running on a runq worker, link the wandb dashboard back to the runq experiment.
-        if "RUNQ_EXPERIMENT_ID" in os.environ:
-            Client().set_wandb_url(int(os.environ["RUNQ_EXPERIMENT_ID"]), wandb_run.url)
+            "training": {
+                "learning_rate": config.training.learning_rate,
+                "warmup_steps": config.training.warmup_steps,
+                "steps": config.training.steps,
+                "batch_size": config.training.tokens.batch,
+                "seq_len": config.training.tokens.len,
+            },
+        },
+    )
+    # When running on a runq worker, link the wandb dashboard back to the runq experiment.
+    if "RUNQ_EXPERIMENT_ID" in os.environ:
+        Client().set_wandb_url(int(os.environ["RUNQ_EXPERIMENT_ID"]), wandb_run.url)
     main_contained(config, wandb_run=wandb_run)
 
 

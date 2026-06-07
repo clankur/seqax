@@ -123,8 +123,7 @@ class DimSpec:
         if self.shape not in v:
             raise TypeCheckError(f"unknown dimension {self.shape}")
         global_shape = v[self.shape]
-        axis_env = jax._src.core.thread_local_state.trace_state.axis_env
-        axis_sizes = {axis.name: axis.size for axis in axis_env} if axis_env else {}
+        axis_sizes = jax._src.core.get_axis_env().axis_sizes
         for axis in self.sharding:
             if axis not in axis_sizes:
                 raise TypeCheckError(f"unknown axis {axis}")
@@ -189,12 +188,12 @@ def check(dtype, shape_spec: ShapeSpec, value):
         raise TypeCheckError(f"has shape {shape}, but expected shape {str(shape_spec)}")
     mesh = None
 
-    axis_env = jax._src.core.thread_local_state.trace_state.axis_env
-    if axis_env:
+    axis_sizes = jax._src.core.get_axis_env().axis_sizes
+    if axis_sizes:
         # We're in a shard_map/pmap/xmap context. Multiply sizes by sharding, then check sizes.
         # We don't actually check the sharding, because that information is lost inside a
         # shard_map/pmap/xmap context, but we do check the unsharded sizes are correct.
-        mesh = {axis.name: axis.size for axis in axis_env}
+        mesh = axis_sizes
         for orig_dim, dim_spec in zip(shape, shape_spec.dims):
             dim = orig_dim
             for axis in dim_spec.sharding:
@@ -234,7 +233,7 @@ def check(dtype, shape_spec: ShapeSpec, value):
                 pass
 
         # Use tracing as a proxy for whether we're in a jit context
-        is_tracing = jax._src.core.thread_local_state.trace_state.trace_stack
+        is_tracing = isinstance(value, jax.core.Tracer)
         if is_tracing:
             jax.debug.inspect_array_sharding(value, callback=cb)
         else:
@@ -383,7 +382,7 @@ def make_partition_specs(cls):
 def make_shardings(cls):
     """Instantiates a pytree dataclass with NamedSharding at array type."""
     mesh = jax._src.mesh.thread_resources.env.physical_mesh
-    return jax.tree_map(lambda spec: jax.sharding.NamedSharding(mesh, spec), make_partition_specs(cls))
+    return jax.tree.map(lambda spec: jax.sharding.NamedSharding(mesh, spec), make_partition_specs(cls))
 
 
 def typed_shard_map(f, **kwargs):
@@ -422,4 +421,4 @@ def is_fully_sharded(spec: jax.sharding.PartitionSpec):
             axis_count += len(axis)
         else:
             raise ValueError(f"Unknown axis type {axis}")
-    return axis_count == len(jax._src.core.thread_local_state.trace_state.axis_env)
+    return axis_count == len(jax._src.core.get_axis_env().axis_sizes)

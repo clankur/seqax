@@ -13,6 +13,7 @@ dependencies = [
     "fsspec[gcs]",
     "einops",
     "hydra-core",
+    "absl-py",  # jax 0.5.x dropped this as a dep, but jax.experimental.pallas still imports it
     "runq",
     "typeguard==4.1.5",
     # Huggingface data loader path
@@ -27,14 +28,14 @@ dependencies = [
 # Pick exactly one of these extras per environment. They are declared
 # conflicting below so uv will refuse to resolve more than one at a time.
 cpu = [
-    "jax[cpu]==0.4.30",
+    "jax[cpu]==0.5.3",
 ]
 gpu = [
-    "jax[cuda12]==0.4.30",
+    "jax[cuda12]==0.5.3",
 ]
 tpu = [
-    "jax==0.4.30",
-    "jaxlib==0.4.30",
+    "jax==0.5.3",
+    "jaxlib==0.5.3",
     "libtpu-nightly==0.1.dev20240617",
 ]
 

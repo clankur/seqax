@@ -21,7 +21,7 @@ import numpy as np
 import wandb
 import zarr
 from jax.experimental import multihost_utils
-from jax.lib import xla_client
+from jax.lib import xla_extension
 from numcodecs import blosc
 
 PyTree = Any
@@ -245,7 +245,7 @@ def save_hlo_svg(filespec: str, compiled: jax.stages.Compiled):
     if shutil.which("dot") is None:
         print(f"graphviz 'dot' not found; skipping HLO SVG dump to {filespec}")
         return
-    compiled_hlo_dot = xla_client._xla.hlo_module_to_dot_graph(compiled.runtime_executable().hlo_modules()[0])
+    compiled_hlo_dot = xla_extension.hlo_module_to_dot_graph(compiled.runtime_executable().hlo_modules()[0])
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "hlo.dot"), "w") as f:
             f.write(compiled_hlo_dot)

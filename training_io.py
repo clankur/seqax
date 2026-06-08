@@ -277,6 +277,10 @@ def get_flops_per_device():
     device = jax.devices()[0].device_kind
     if device.startswith("NVIDIA A100"):
         result = 312e12
+    elif "RTX 4090" in device:
+        # Ada bf16/fp16 dense tensor cores with FP32 accumulate (NVIDIA Ada whitepaper). Consumer Ada
+        # runs FP16-with-FP32-accumulate at half the FP16-accumulate rate, so this is 165 (not 330).
+        result = 165e12
     else:
         print(f"Unrecognized device, assuming ridiculously low 1 MFLOPS. Device name: {device}")
         result = 1e6

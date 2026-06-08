@@ -51,7 +51,7 @@ conflicts = [
 
 [tool.uv.sources]
 # runq (self-hosted experiment queue) is not on PyPI; install from its git repo.
-runq = { git = "https://github.com/clankur/runq.git" }
+runq = { git = "ssh://git@github.com/clankur/runq.git" }
 # libtpu-nightly is published on Google's libtpu index, not PyPI.
 libtpu-nightly = { index = "libtpu" }
 # Force the CPU torch build everywhere — the Huggingface data loader needs

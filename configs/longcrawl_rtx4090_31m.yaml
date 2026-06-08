@@ -31,9 +31,7 @@ model:
 longcrawl:
   path: "/mnt/HDD/longcrawl64/data"
 
-# Checkpoints/outputs on the dedicated SSD: the 240GB root SSD fills up; /mnt/SSD (sdc1, ext4) has room.
 paths:
   root_working_dir: "/mnt/SSD/seqax_outputs"
 
-# Every 4000 (not 400) steps: ~0.5GB/checkpoint, so 400 would pile up ~96 of them per run.
 checkpoint_interval: 4000 

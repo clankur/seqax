@@ -1,0 +1,42 @@
+# Compute-bound config for fp8-vs-bf16 profiling on a single RTX 4090.
+# d_model/d_ff are ~8x the 31m config so the 6 weight-projection GEMMs dominate the step
+# (at 31m they're a rounding error -> 2.5% MFU). Only ~5 steps: the profiler fires at step 2.
+# fp8 run:  python -m train --config-name=longcrawl_rtx4090_profile +paths.model_name=prof_fp8  +training.queue=gpu paths.root_working_dir=/tmp
+# bf16 run: python -m train --config-name=longcrawl_rtx4090_profile +paths.model_name=prof_bf16 +training.queue=gpu paths.root_working_dir=/tmp model.fp8=false
+defaults:
+- longcrawl_base
+- _self_
+
+num_hosts: 1
+
+mesh:
+  d: 1
+  t: 1
+
+training:
+  warmup_steps: 5
+  steps: 5
+  steps_for_lr: 5
+  learning_rate: 7.3e-3
+  tokens:
+    batch: 8
+    len: 1024
+
+model:
+  d_model: 2048
+  n_q_per_kv: 1
+  n_kv: 16
+  d_head: 128
+  d_ff: 8192
+  layers: 8
+  vocab: 50304
+  rope_max_timescale: 10000
+  fp8: true
+
+longcrawl:
+  path: "/mnt/HDD/longcrawl64/data"
+
+paths:
+  root_working_dir: "/tmp"
+
+checkpoint_interval: 1000

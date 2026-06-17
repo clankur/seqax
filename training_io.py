@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import jax.profiler
 import numpy as np
+import wandb
 import zarr
 from jax.experimental import multihost_utils
 from jax.lib import xla_client
@@ -35,29 +36,26 @@ class IOConfig:
     max_io_threads: int
 
 
-def log(step: int, logger, output: PyTree, wandb_run=None):
+def log(step: int, output: PyTree, wandb_run=None):
     """Logs the output of a training step. The output must be a PyTree of f32 arrays.
 
     Args:
-        logger: ClearML Logger instance, or None.
         wandb_run: wandb Run instance, or None.
     """
     if jax.process_index() == 0:
-        metrics_dict = {}
+        metrics_dict = {}  # scalars; also printed to stdout
+        histograms = {}  # non-scalar f32 arrays, logged to wandb only
         for path, arr in jax.tree_util.tree_leaves_with_path(output):
             path = jax.tree_util.keystr(path)
             arr = jax.device_get(arr)
             if arr.shape == () and arr.dtype == jnp.float32:
-                if logger:
-                    logger.report_scalar(title=path, series=path, value=arr, iteration=step)
                 metrics_dict[path] = float(arr)
             elif arr.dtype == jnp.float32:
-                if logger:
-                    logger.report_histogram(title=path, series=path, values=arr, iteration=step)
+                histograms[path] = wandb.Histogram(arr)
             else:
                 raise ValueError(f"Output {path} has unsupported shape {arr.shape} and dtype {arr.dtype}.")
         if wandb_run is not None:
-            wandb_run.log(metrics_dict, step=step)
+            wandb_run.log({**metrics_dict, **histograms}, step=step)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] Step {step}: {metrics_dict}")
 
@@ -242,6 +240,11 @@ def fsspec_put(local_src: str, remote_dst: str):
 
 def save_hlo_svg(filespec: str, compiled: jax.stages.Compiled):
     """Saves a compiled function's HLO to an SVG file."""
+    # The SVG is a diagnostic, not part of training -- skip it (rather than crash) when the graphviz
+    # `dot` binary isn't installed, e.g. on a bare GPU worker.
+    if shutil.which("dot") is None:
+        print(f"graphviz 'dot' not found; skipping HLO SVG dump to {filespec}")
+        return
     compiled_hlo_dot = xla_client._xla.hlo_module_to_dot_graph(compiled.runtime_executable().hlo_modules()[0])
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "hlo.dot"), "w") as f:
@@ -274,6 +277,10 @@ def get_flops_per_device():
     device = jax.devices()[0].device_kind
     if device.startswith("NVIDIA A100"):
         result = 312e12
+    elif "RTX 4090" in device:
+        # Ada bf16/fp16 dense tensor cores with FP32 accumulate (NVIDIA Ada whitepaper). Consumer Ada
+        # runs FP16-with-FP32-accumulate at half the FP16-accumulate rate, so this is 165 (not 330).
+        result = 165e12
     else:
         print(f"Unrecognized device, assuming ridiculously low 1 MFLOPS. Device name: {device}")
         result = 1e6

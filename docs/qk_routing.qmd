@@ -369,12 +369,45 @@ got wrong:
 |---|---|
 | Router trained by a proxy, not by CE (#1, #3, #4) | **NSA** (DeepSeek, [2502.11089](https://arxiv.org/abs/2502.11089)) is *"natively trainable... unlike baselines which train with full attention and apply sparsity post-hoc."* Sparsity is in the forward path from step 0 and the selection is differentiable end-to-end. |
 | Ad-hoc gate/router, no MoE-style balancing (#3) | **MoBA** (Moonshot/Kimi, [2502.13189](https://arxiv.org/abs/2502.13189)) — literally "Mixture of Block Attention": MoE gating routes each query to a subset of KV *blocks*, with a seamless full↔sparse switch. This is the design this project was groping toward. |
-| Router got no LM-quality signal (#4) | **DSA** (DeepSeek-V3.2, [2512.02556](https://arxiv.org/abs/2512.02556)) trains a lightweight **lightning indexer** (multi-head ReLU-gated scores) to pick top-k=2048 tokens, and trains the indexer by **distilling the dense attention distribution** — a clean supervised target instead of a collapse-prone budget loss. |
-| Masking added compute instead of saving it | All three are paired with **hardware-aligned kernels** (blockwise selection to keep memory access contiguous). Sparsity you can't turn into a faster kernel is just overhead — see below. |
+| Router got no LM-quality signal (#4) | **DSA** (DeepSeek-V3.2, [2512.02556](https://arxiv.org/abs/2512.02556)) trains a lightweight **lightning indexer** (multi-head ReLU-gated scores) to pick top-k=2048 tokens. Its successor makes the indexer **natively trainable end-to-end** — no collapse-prone budget loss at all. |
+| Masking added compute instead of saving it | All are paired with **hardware-aligned kernels** (blockwise selection to keep memory access contiguous). Sparsity you can't turn into a faster kernel is just overhead — see below. |
 
-Note on naming: the current DeepSeek sparse-attention model is **V3.2** (DSA),
-not a "V4"; DSA sits on the MLA backbone with decoupled RoPE — i.e. the
-content/position split this project started from, done properly.
+### DeepSeek-V4 fuses all three of these threads — and does the RoPE trick this project's author independently proposed
+
+**DeepSeek-V4** (open-weight MoE, released Apr 24 2026;
+[2606.19348](https://arxiv.org/abs/2606.19348)) is the culmination, and it is
+worth dwelling on because it is essentially *every* idea in this report, done
+right and fused into one architecture. It interleaves two attention types:
+
+- **Compressed Sparse Attention (CSA)** — compress every $m$ tokens into one KV
+  entry, then apply DSA **top-k selection over the compressed entries** via a
+  **low-rank "lightning indexer"** that is *natively trainable end-to-end* (no
+  auxiliary or distillation loss for the router). Block-level, `c4a` ≈ 4×
+  compression, $k=512$. **This is the corrected version of qk-routing**:
+  block-level, natively trainable, an indexer instead of a collapse-rewarding
+  recall budget, sparsity in the forward path from step 0.
+- **Heavily Compressed Attention (HCA)** — much more aggressive temporal
+  compression (`c128a` ≈ 128×) but **dense** attention over the few remaining
+  compressed tokens. **This is the LCM / KV-compression direction**
+  ([`lcm.qmd`](lcm.qmd)).
+
+The payoff: at 1M-token context, V4-Pro uses **27% of the single-token inference
+FLOPs and 10% of the KV cache** of V3.2, on fused kernels (compressor +
+RMSNorm + RoPE; inverse-RoPE + fp8; an FP4 indexer).
+
+**The RoPE detail is the one to notice.** V4 *shares* its K and V vectors and
+compresses them — and with a shared vector you cannot RoPE it for the key role
+without also rotating it in the value role. V4's answer is exactly the
+"rope-then-un-rope-the-output" operation: it applies RoPE to the last 64
+(decoupled) dimensions of the shared/compressed KV entry at its absolute
+position $j$, and after attention applies **RoPE with position $-i$** (the query
+position) to the *output*. The value path $\sum_j a_{ij} R_j v_j$ becomes
+$R_{-i}\sum_j a_{ij} R_j v_j = \sum_j a_{ij} R_{j-i} v_j$ — every value rotated by
+its **relative** offset to the query, restoring translation invariance under
+shared KV. It is the enabling trick for shared-KV + RoPE, and it composes
+directly with the **shared-KV work already in this repo**
+([`shared_kv.qmd`](shared_kv.qmd)): shared-KV made RoPE incompatible, and this
+is the fix.
 
 ## Future directions
 
@@ -392,9 +425,9 @@ ever did:
 | Make the gate bias an annealed hparam, not a hardcoded constant | #5 |
 | Fix the post-training LR horizon (`steps_for_lr = steps // 3`) | #6 |
 | Fix the grad-norm exclusion to the real weight names | #7 |
-| **Swap ALiBi for RoPE or NoPE + decoupled-RoPE** so the position encoding stops fighting long-range retrieval. `position_embeddings.qmd` already has the dense RoPE-vs-ALiBi comparison at this scale to seed the choice | structural #4 |
+| **Swap ALiBi for RoPE or NoPE + decoupled-RoPE** so the position encoding stops fighting long-range retrieval. `position_embeddings.qmd` already has the dense RoPE-vs-ALiBi comparison at this scale to seed the choice; if combined with shared-KV, use V4's RoPE / inverse-RoPE-on-the-output trick (see above) | structural #4 |
 
-Prefer **block-level** routing (MoBA/NSA) over the per-key partition mask:
+Prefer **block-level** routing (MoBA/NSA/V4-CSA) over the per-key partition mask:
 selecting contiguous KV blocks is both easier to load-balance and the only kind
 of sparsity a TPU/GPU kernel can actually exploit.
 
@@ -404,8 +437,18 @@ The *goal* was shrinking the KV cache. Sparse routing is one way; **low-rank KV
 compression (MLA)** is the proven other way, and there is already an `mla` branch
 in the repo. MLA gets the same inference-time saving without a router to train,
 sidestepping the entire failure mode documented here. Given that this lineage
-literally began as an MLA experiment, closing the loop back to MLA — or MLA *plus*
-a DSA-style indexer on top — is the most direct path to the original objective.
+literally began as an MLA experiment, closing the loop back to MLA is the most
+direct path to the original objective.
+
+But the sharper target is **DeepSeek-V4's synthesis**, because it unifies three
+things this repo already has separate branches for: shared-KV
+([`shared_kv.qmd`](shared_kv.qmd)), KV compression
+([`lcm.qmd`](lcm.qmd)), and the sparse routing documented here. V4's recipe —
+**HCA** (heavy temporal compression + dense attention, i.e. the LCM idea) on most
+layers, **CSA** (light compression + natively-trainable top-k block selection,
+i.e. the *fixed* qk-routing) on the rest, shared-KV with the RoPE/inverse-RoPE
+trick throughout — is a concrete, published blueprint for combining all three
+into one model rather than testing them in isolation.
 
 ### 3. Custom kernels — the actually-important lesson
 

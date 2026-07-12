@@ -1,10 +1,14 @@
 ---
 title: "Routing queries to KV-cache partitions"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
 ---
 
 The `parition_qk_alibi` family tested learned sparse attention: each query routes to a small set of *partitions* of the KV cache instead of attending densely, on top of ALiBi. Six branches were tried — `parition_qk_alibi`, `_embed`, `_embed_mlp_q`, `_embed_post_training`, `_embed_post_training_no_stats`, `_embed_post_training_retrieval_penalty`. Across 75 runs on three datasets, no configuration beat — or matched — the dense ALiBi baseline it started from.
 
-Hard partition routing is the intended inference behavior: at deployment each query attends only within its routed partition(s), so evaluation correctly forces the hard mask. The failure has two layers. First, the from-scratch configs leave the mask-activation schedule at its Hparams default of `1.0` (no config overrides it), so the hard mask was **never used during training** — the model trained dense and met its own routing for the first time at eval, producing a large, seed-dependent train/eval gap. Schedules that *do* reach the hard mask during training close that gap to ≈0. What remains once the gap is closed is the method's real ceiling: matched-schedule and post-training runs are consistent train-to-eval but still land ~0.1–0.4 nats above dense, because the routing objective and masked-attention math (defects #2–#5 below) cannot learn a sparse pattern that preserves quality.
+Hard partition routing is the intended inference behavior: at deployment each query attends only within its routed partition(s), so evaluation correctly forces the hard mask. The failure has two layers. First, *most* from-scratch configs leave the mask-activation schedule at its Hparams default of `1.0`, so their hard mask never activates during training — the model trains dense and meets its own routing for the first time at eval, producing a large, seed-dependent train/eval gap. A handful of runs *do* schedule the mask on earlier (`hard_frac < 1.0`, and one that trains through the hard mask from step 0), and there the train/eval gap closes to ≈0. But those same runs expose why the harder schedule was never pursued consistently: turning the mask on during training already pushes eval perplexity *above* the dense ALiBi baseline (ppl 34.7–42.2 vs 32.6), so there was no reason to expect the stricter hard mask to recover quality. What remains once the gap is closed is the method's real ceiling: matched-schedule and post-training runs are consistent train-to-eval but still land ~0.1–0.4 nats above dense, because the routing objective and masked-attention math (defects #2–#5 below) cannot learn a sparse pattern that preserves quality.
 
 ## Mechanism
 
@@ -30,7 +34,7 @@ Branch line references are on the `old_experiments` remote (`github.com/clankur/
 
 | # | Defect | Branch / location | Failure signature |
 |---|---|---|---|
-| 1 | **Training never used the routing.** Hard-routed eval is the intended inference path (forced via `total_steps=0`, which is correct), but the from-scratch configs leave `*_start_fraction` at its default `1.0` (no config overrides it), so the soft/hard masks never activate during training. The model trains dense and meets its own routing only at eval. This is a schedule/protocol choice, not a code bug — and the fix is on the *training* side. | Hparams default (`*_start_fraction`) | train ≈ dense, eval blows up & **seed-dependent — but only at `hard_frac=1.0`**; schedules that reach the hard mask in training close the gap (below) |
+| 1 | **Most runs never exercised the routing.** Hard-routed eval is the intended inference path (forced via `total_steps=0`, which is correct), but most from-scratch configs leave `*_start_fraction` at its default `1.0`, so their soft/hard masks never activate during training and the model meets its own routing only at eval. The runs that *do* schedule masking on early were not pursued further because soft-masked training already lands above the dense baseline (ppl 34.7–42.2 vs 32.6). This is a schedule/protocol choice, not a code bug — and the fix is on the *training* side. | Hparams default (`*_start_fraction`) | train ≈ dense, eval blows up & **seed-dependent — but only at `hard_frac=1.0`**; schedules that reach the mask in training close the gap but still sit above baseline (below) |
 | 2 | **Masked probs not renormalized.** Hard path multiplies `probs * hardmask` without re-softmax, shrinking the attention output by the recall fraction. The other four branches re-softmax the masked logits, so this bites `base`/`_mlp_q` only. | base, `_mlp_q` | eval 3.49→6.2 (c4 `base` run) |
 | 3 | **Routing objective rewards collapse.** `recall_loss = -log(cluster_recall / total_raw_probs)` is minimized by routing everything to one partition; no load-balancing/entropy term. `retrieve_loss` (penalty branch) is *negative and added*, so the optimizer lowers total loss by sparsifying at CE's expense. | all; penalty term in `_retrieval_penalty` | total loss ↓ (even negative) while CE ↑ |
 | 4 | **`stop_gradient` on the attention distribution.** In `base`/`_mlp_q` the soft path is `stop_gradient(probs) * softmask`, so CE gives the routing no gradient. The `_embed`/`_post_training`/`_no_stats`/`_retrieval_penalty` branches reworked this to a re-softmax with `log(softmask)` as an additive bias and **no** `stop_gradient` — there CE *does* reach the routing weights (only `nq`/`nk` are stop-gradiented). | base, `_mlp_q` | mask-on training degrades CE monotonically (base/`_mlp_q`) |
@@ -145,7 +149,7 @@ def short_variant(v):
 
 ## Training looks healthy: from-scratch runs track the dense baseline
 
-On c4, the from-scratch partition runs train to the same loss as dense ALiBi — because with `softmask_start_fraction = hardmask_start_fraction = 1.0` the routing masks are never in the forward path during training (defect #1). The model is plain dense ALiBi attention throughout. Runs that turn masking on earlier (`soft=0.5/hard=0.8`) are visibly worse, the only effect of the routing being to *degrade* the CE it cannot receive gradient for (defects #3, #4).
+On c4, the from-scratch partition runs *with the default `1.0` schedule* train to the same loss as dense ALiBi — because the routing masks are never in the forward path during training (defect #1). The model is plain dense ALiBi attention throughout. Runs that turn masking on earlier (`soft=0.5/hard=0.8`) are visibly worse, the only effect of the routing being to *degrade* the CE it cannot receive gradient for (defects #3, #4).
 
 ```{python}
 runs = load_segment("c4", "base") + load_segment("c4", "embed")
@@ -326,8 +330,7 @@ summary.style.format(precision=2).hide(axis="index")
 ## Limitations
 
 - All runs are 31M parameters; c4/slim at $L=1024$, longcrawl at long context. The mechanism could behave differently at scale.
-- Many runs are marked `failed` in ClearML but completed training and the final eval — the crash is a checkpoint-upload/teardown error after metrics were logged. Their eval numbers are valid and are used here.
-- The from-scratch runs almost all used `*_start_fraction = 1.0`, so the soft→hard annealing schedule was never actually trained through. No run combines early soft-masking, renormalized probabilities, and a load-balanced objective — i.e. the corrected design was never tested.
+- In almost all from-scratch runs `*_start_fraction = 1.0`, so the soft→hard annealing schedule was never trained through; the few runs that did activate masking early already fell short of the dense baseline. No run combines early soft-masking, renormalized probabilities, and a load-balanced objective — i.e. the corrected design was never tested.
 - No KV-cache memory or latency was measured; results are loss-only.
 
 ## What a corrected experiment would need

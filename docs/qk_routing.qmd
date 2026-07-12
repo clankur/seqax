@@ -1,0 +1,527 @@
+---
+title: "QK routing: a failed attempt at MoE-inspired sparse attention"
+---
+
+Over about eight months this line of work tried to make attention sparse the way
+Mixture-of-Experts made the feed-forward network sparse: instead of every query
+attending densely to the whole KV cache, route each query to a small set of
+learned **partitions** of the cache and attend only there. If it worked, the
+payoff would be a smaller KV-cache read at inference — the dominant
+memory-and-latency cost of long-context serving — bought without hurting
+language-modeling quality.
+
+It did not work. Across **230 runs on five datasets** — 136 in the "clustering"
+lineage, 75 in the "partition" lineage, and 19 dense baselines — no
+configuration beat, and only a handful matched, the dense ALiBi baseline it
+started from. This report compiles the whole arc: where the idea came from, how
+it mutated from hard k-means clustering into soft learned routing into a
+MoE-style partition gate, exactly why each incarnation failed, and — because the
+failures turned out to be well-understood ones that the field has since
+solved — what a corrected attempt (and the custom kernels it would need) should
+look like.
+
+::: {.callout-note}
+## The one-sentence version
+Training loss was never the problem — every variant trained down to roughly the
+dense baseline. The problem was always the *sparse* attention path: it never
+received a language-modeling gradient, it was graded at eval on a routing it was
+never trained through, and its objective rewarded collapse. The most honest
+commit in the entire history reads: *"sparse clustering... recalls 40% with 40%
+of keys."* That is the ceiling, stated plainly.
+:::
+
+## Where the idea came from
+
+The lineage literally grew out of an MLA experiment (`ce43340 "setup mla"`). The
+motivating analogy: MoE routes each token to $k$ of $N$ expert FFNs and only pays
+for those $k$; attention, by contrast, pays for the *entire* KV cache on every
+query. If a query could be routed to a few relevant partitions of the cache —
+"these 2 of 64 partitions hold what this query needs" — the inference-time KV
+read would shrink by the sparsity factor. That is the thesis the whole project
+was testing.
+
+Two design choices, made early, shaped everything downstream:
+
+- **Routing on the positionless projection.** Queries and keys were routed using
+  their *content* projection with no position encoding (`ln_q_nope`,
+  `ln_k_nope`, `apply_rope=False`), while **ALiBi** carried position separately.
+  This is structurally the same content/position split that DeepSeek's MLA makes
+  with its *decoupled RoPE* — the routing decision is content-based, position is
+  bolted on. The project was decoupling position from routing from day one; it
+  just used ALiBi's recency bias to do it (a choice that, in hindsight, actively
+  fought the retrieval objective — see [Why it failed](#why-it-failed)).
+- **Hard routing is the deployment behavior.** At inference each query must
+  attend within its routed partition(s) only — that is where the KV saving comes
+  from — so evaluation *correctly* forces the hard mask (via `total_steps=0`, so
+  every schedule threshold is met at step 0). The failure is never that eval is
+  "unfair"; it is that training rarely matched what eval graded.
+
+## Two lineages, one dead end
+
+What looks like a single chain of branches is really **two independent trees**
+that converge on the same design and the same wall.
+
+| Era | Branch | Idea | Dataset(s) | Runs |
+|---|---|---|---|---|
+| **Tree A** — hard clustering | `cluster_qk` | k-means attention: argmax-assign each q and k to a cluster, attend iff same cluster | slim, starcoder | 30 |
+| | `cluster_qk_alibi` | same, on the ALiBi baseline | slim | 31 |
+| | `cluster_qk_alibi_v2` | split q/k centroids; attention-aware key objective; skip layer 0 | slim | 8 |
+| **Tree B** — soft routing | `cluster_qk_alibi_lora` | **fresh start off `alibi`**: soft `sigmoid` query gate + `softmax` key router, outer-product keep-mask, soft→hard schedule, recall/retrieve budget loss | slim | 66 |
+| | `cluster_qk_alibi_lora_mlp_q` | nonlinear (SwiGLU) query gate | slim | 1 |
+| **Partition** — Tree B, renamed + extended | `parition_qk_alibi` | Tree B's routing, `clusters`→`partitions` | c4, slim | 1 |
+| | `..._embed` | route off the layer-input embedding $g_x$, not q/k | c4, slim | 23 |
+| | `..._embed_mlp_q` | MLP query gate | — | — |
+| | `..._embed_post_training` | freeze a pretrained dense model, tune only routing | c4, longcrawl | 32 |
+| | `..._embed_post_training_no_stats` | logging only | — | — |
+| | `..._embed_post_training_retrieval_penalty` | add a sparsity-budget loss term | c4 | 19 |
+
+Two facts this table encodes that the branch names hide:
+
+1. **The partition lineage is not descended from the clustering lineage.** The
+   soft-routing branch `cluster_qk_alibi_lora` was branched *fresh off the dense
+   `alibi` baseline*, not off the hard-clustering code (`git merge-base` confirms
+   it shares only the old pre-clustering ancestor). `parition_qk_alibi` is then
+   essentially `cluster_qk_alibi_lora` with three renames
+   (`clusters`→`partitions`, `q_clusters`→`w_q_gate`, `k_clusters`→`w_k_routing`)
+   plus two additions (route off $g_x$; add post-training). **The conceptual
+   jump — hard argmax clustering to soft learned routing — happened *inside* the
+   clustering lineage, not between the two.**
+2. **The two lineages never shared a comparison dataset except slim.** Clustering
+   ran only on slim and starcoder; partition ran only on c4, slim, and
+   longcrawl. **Slim is the only apples-to-apples ground** between them — and on
+   slim, both top out at the *same* number (eval ≈ 1.85, ppl ≈ 6.3), i.e. dense
+   parity, via completely different machinery.
+
+## The mechanism, and how it mutated
+
+Every variant is a specialization of one skeleton. Per attention layer, on top
+of standard ALiBi-causal attention with scores `logits` and
+`probs = softmax(logits)`:
+
+1. **Route the query and the key.** Produce, per partition, a query "gate" and a
+   key "assignment":
+   $$
+   q_\text{gate} = \sigma(g \cdot W_q) \in [0,1]^{N},\qquad
+   k_\text{route} = \mathrm{softmax}(g \cdot W_k) \in \Delta^{N}
+   $$
+   where $g$ is the routing input ($\mathrm{norm}(q)$/$\mathrm{norm}(k)$ early,
+   the layer-input embedding $g_x$ in the `_embed` variants) and $N$ is the
+   partition count.
+2. **Form a keep-mask.** The outer product over partitions gives a soft
+   keep-probability per (query, key) pair,
+   `softmask = einsum(q_gate, k_route) * causal`.
+3. **Attend through the mask.** Either `probs * softmask` (early branches) or a
+   re-softmax with `log(softmask)` as an additive bias (later branches).
+4. **Train the router by an auxiliary loss** (`recall_loss`, `retrieve_loss`) —
+   *not* directly by the LM loss.
+5. **Schedule soft→hard.** `apply_softmask` and `apply_hardmask` switch on at
+   `step >= start_fraction * total_steps`. The **hard** path
+   (`q_gate > threshold`, $\arg\max$ over `k_route`) is the inference behavior;
+   eval forces it with `total_steps=0`.
+
+The mutation across the arc is entirely in *how q and k get routed* and *how the
+router is trained*:
+
+| | Routing unit | Query side | Key side | Router trained by | Train/eval |
+|---|---|---|---|---|---|
+| `cluster_qk` / `_alibi` | cluster (hard) | $\arg\max(nq\cdot C)$ | $\arg\max(nk\cdot C)$, shared centroids $C$ | k-means alignment loss | on from step 0 |
+| `cluster_qk_alibi_v2` | cluster (hard) | $\arg\max(nq\cdot C_q)$ | key-centroid picked by q's cluster, aligned to prob-weighted attended key | attention-aware k-means | on from step 0 |
+| `cluster_qk_alibi_lora` | cluster (soft) | $\sigma(nq\cdot C_q)$ | $\mathrm{softmax}(nk\cdot C_k)$ | recall − retrieve budget | soft/hard start-fractions |
+| `parition_qk_alibi(_embed)` | partition (soft) | $\sigma(g\cdot W_q)$ | $\mathrm{softmax}(g\cdot W_k)$ | recall − retrieve budget | soft/hard start-fractions |
+
+The through-line: **from a symmetric geometric clustering trained by a k-means
+objective that is structurally decoupled from the LM loss → to an asymmetric
+learned gate/router trained by a recall/sparsity budget that is *still*
+decoupled from the LM loss.** That decoupling — the router never being told, by
+the thing that actually matters, that its routing was bad — is the single thread
+that runs unbroken through all 211 routing runs.
+
+```{python}
+# | code-fold: true
+# | code-summary: "Data-loading harness (shared by all figures)"
+import csv
+import json
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = "plotly_mimetype+notebook_connected"
+ROOT = Path("../clearml_experiments")
+PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+           "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+def ema(xs, s=0.97):
+    out = [xs[0]]
+    for v in xs[1:]:
+        out.append(out[-1] * s + v * (1 - s))
+    return out
+
+
+def read_csv(p):
+    if not p.exists():
+        return None
+    rows = list(csv.DictReader(open(p)))
+    if not rows:
+        return None
+    return [int(float(r["step"])) for r in rows], [float(r["value"]) for r in rows]
+
+
+def load_run(d):
+    md = json.loads((d / "metadata.json").read_text())
+    m = d / "metrics"
+    train = read_csv(m / "loss_loss.csv")
+    ev = read_csv(m / "final_loss_eval.csv")
+    cfg = {k.split(".", 1)[1]: v for k, v in md.get("hyperparameters", {}).items()
+           if k.startswith("Hydra/model.") or k.startswith("Hydra/training.")}
+    return {
+        "name": md["experiment_name"], "status": md["status"], "config": cfg,
+        "train_steps": train[0] if train else None,
+        "train_loss": train[1] if train else None,
+        "train_ema": ema(train[1])[-1] if train else None,
+        "eval": ev[1][-1] if ev else None,
+        "n_clusters": int(cfg.get("n_clusters", cfg.get("n_partitions", 0)) or 0),
+    }
+
+
+def load_group(rel):
+    p = ROOT / rel
+    if not p.exists():
+        return []
+    return [load_run(d) for d in sorted(p.iterdir()) if d.is_dir()
+            and (d / "metadata.json").exists()]
+```
+
+## What the numbers show
+
+### Training always looked healthy
+
+The first and most misleading signal: **train loss was never the problem.**
+Every stage of the clustering lineage — hard clustering, split-centroid v2, soft
+LoRA routing — trains down to essentially the dense slim baseline (train ≈ 1.78).
+The routing masks are either off during training (the default schedule) or, when
+on, contribute no useful gradient, so the model is effectively training as dense
+ALiBi and the curve looks fine. Nothing here warns you that eval will collapse.
+
+```{python}
+# | code-fold: true
+# | code-summary: "Clustering lineage: best train curve per stage (slim)"
+STAGES = [
+    ("cluster_qk", "slim_v4_32_31m/cluster_qk", "#1f77b4"),
+    ("cluster_qk_alibi", "slim_v4_32_31m/cluster_qk_alibi", "#ff7f0e"),
+    ("cluster_qk_alibi_v2", "slim_v4_32_31m/cluster_qk_alibi_v2", "#2ca02c"),
+    ("cluster_qk_alibi_lora", "slim_v4_32_31m/cluster_qk_alibi_lora", "#9467bd"),
+]
+fig = go.Figure()
+fig.add_hline(y=1.78, line=dict(color="black", dash="dash"),
+              annotation_text="dense ALiBi (slim train ≈ 1.78)",
+              annotation_position="top right")
+for label, rel, color in STAGES:
+    runs = [r for r in load_group(rel) if r["train_loss"] is not None
+            and r["train_ema"] is not None and r["train_ema"] > 1.0]  # drop 0.0 crashes
+    if not runs:
+        continue
+    best = min(runs, key=lambda r: r["train_ema"])
+    fig.add_trace(go.Scatter(x=best["train_steps"], y=ema(best["train_loss"]),
+                             mode="lines", name=label, line=dict(color=color, width=2),
+                             hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.3f}<extra></extra>"))
+fig.update_layout(xaxis_title="Step", yaxis_title="Training loss (EMA)", height=460,
+                  yaxis_range=[1.6, 3.0],
+                  legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                  margin=dict(l=60, r=20, t=20, b=80))
+fig.show()
+```
+
+Most clustering runs logged train loss *only* — no eval — which is itself part
+of the story: the lineage was steered by the curve that looked good, and the
+eval-time collapse (where it was measured at all) was under-instrumented until
+late. Cross-group eval comparison exists cleanly only for the partition-embed
+groups and the one LoRA group with eval logged.
+
+### Eval never beat dense — both lineages plateau at parity
+
+On slim, the *only* dataset the two lineages share, they land on the same number
+from opposite directions:
+
+```{python}
+# | code-fold: true
+# | code-summary: "Slim: best eval per lineage vs dense"
+rows = [
+    {"lineage": "dense ALiBi", "config": "baseline", "eval": None, "ppl": None,
+     "train": 1.78, "note": "baseline (eval not logged; train 1.78)"},
+    {"lineage": "cluster (soft/lora)", "config": "n_clusters=512", "eval": 1.849, "ppl": 6.36,
+     "train": None, "note": "best of 66 LoRA runs"},
+    {"lineage": "partition (embed)", "config": "n_part=512", "eval": 1.848, "ppl": 6.35,
+     "train": 1.78, "note": "best of 15 partition-embed runs"},
+    {"lineage": "partition (embed)", "config": "plain routed, 512-part", "eval": 4.58, "ppl": 97.0,
+     "train": None, "note": "worst — routing engaged, collapsed"},
+]
+pd.DataFrame(rows).style.format({"eval": "{:.3f}", "ppl": "{:.1f}", "train": "{:.2f}"},
+                                na_rep="—").hide(axis="index").set_caption(
+    "slim: both lineages top out at dense parity (~1.85 / ppl 6.3); neither improves on it.")
+```
+
+On c4 and longcrawl — where only the partition lineage ran — it is strictly
+worse: c4 active-partition runs land at eval 3.55–3.74 (ppl 34.7–42.2) versus
+dense 3.49 (32.6); the best longcrawl post-training result reaches 3.37 versus
+dense 3.17, **+0.2 nats**. Every partition figure that isn't an artifact of the
+routing failing to engage is above the dense baseline.
+
+### The train/eval gap is a schedule artifact — and closing it reveals the real ceiling
+
+The most violent numbers (c4 eval 6.2; slim 512-partition eval 4.58) are a
+**train/eval mismatch**, not an inherent property of hard routing. With the
+default `softmask_start_fraction = hardmask_start_fraction = 1.0`, the masks
+never activate during training — the model trains dense and meets its own hard
+routing for the first time at eval. Runs that reach the hard mask *during*
+training (`hard_frac < 1.0`) close the gap to ≈ 0, exactly as they should, since
+train and eval then use the same routing. The mismatch is removable. What
+remains once it is closed is the method's real ceiling: matched-schedule and
+post-training runs are train/eval-consistent but still land **~0.1–0.4 nats
+above dense**, because the routing objective and masked-attention math cannot
+learn a sparse pattern that preserves quality. The partition report
+([`partition_qk_alibi.qmd`](partition_qk_alibi.qmd)) works this schedule story
+through run by run.
+
+### Post-training loss only ever rose; the retrieval penalty optimized the wrong thing
+
+Two clean demonstrations of the objective being broken rather than the
+optimization being unlucky:
+
+- **Post-training** (freeze a dense model, tune only the routing) is the purest
+  test — no train/eval mismatch, since it trains through the soft-into-hard
+  schedule. On longcrawl every run's CE rises *monotonically from its step-0
+  minimum* (the dense starting point). Freezing the language model and letting
+  only the router move cannot recover the quality the partition mask removes.
+- **The retrieval-penalty branch** adds `retrieve_loss = mean_layers log(retrieved_fraction)`,
+  a *negative* quantity *added* to the loss — so total loss drops when fewer keys
+  are retrieved, regardless of CE. The trap is visible directly: total loss falls
+  below zero while CE climbs to ≈ 9.5 (eval perplexity **12k–13k**, near random
+  init). The optimizer is cashing in language-modeling quality for the sparsity
+  reward.
+
+## Why it failed {#why-it-failed}
+
+The line-level bugs (below) are real and each maps to a measured failure, but the
+method would not have worked even bug-free, for four structural reasons:
+
+1. **The router never received a language-modeling gradient.** This is the
+   unbroken thread. In Tree A the mask is a non-differentiable $\arg\max$ and the
+   alignment is `stop_gradient`'d, so CE contributes *zero* gradient to the
+   clustering — routing quality is decoupled from LM quality by construction. In
+   Tree B the soft path in the *base* and `_mlp_q` branches is literally
+   `stop_gradient(probs) * softmask`. (Nuance the earlier partition writeup got
+   wrong: the `_embed`/`_post_training`/`_no_stats`/`_retrieval_penalty` branches
+   *did* fix this — they re-softmax with `log(softmask)` as an additive bias, so
+   CE does reach the routing weights. But in the default schedule the soft mask
+   is off during training anyway, so on those branches the router still learned
+   from CE only if a schedule override turned masking on.) Either way, the router
+   was overwhelmingly trained by a proxy objective, not by the loss it needed to
+   minimize.
+2. **The router was graded on a routing it was never trained through.** Hard
+   routing is the correct eval, but the default schedule trained dense. Train ≠
+   test, catastrophically and seed-dependently.
+3. **The routing objective rewarded collapse.** `recall_loss` (and its ratio and
+   budget variants) has no load-balancing or entropy term. Routing every key to
+   one partition and opening that gate maximizes recall — a valid minimizer that
+   destroys the whole point. The retrieval penalty made this worse by adding a
+   sparsity reward that trades directly against CE.
+4. **The router design forced ALiBi, and ALiBi's recency prior then fought the
+   retrieval thesis.** The router assigned *each individual q and k vector* to a
+   partition by dotting it against fixed learned centroids
+   (`q_c = einsum(nq, q_clusters)`). That is a per-vector, nearest-centroid
+   decision — and it *requires a positionless representation*, because RoPE
+   rotates each vector by its **absolute** position: $q_i\!\cdot\!c = (R_i q)\cdot
+   c$ varies with position even for identical content, so the same token would
+   route to different partitions depending on where it sits, and a query and its
+   relevant key would rotate into different partitions. RoPE's relative-position
+   property lives only in the $q\!\cdot\!k$ product ($q^\top R_{j-i} k$), never in
+   the individual vectors the router sees. So RoPE was structurally incompatible
+   with centroid routing, and ALiBi — a scalar logit bias that keeps position
+   *out* of q/k — was the workaround (commit `a7ccfdb` "disable pes unless
+   specified"; the `_nope` naming; `be28001` moving routing onto the un-RoPE'd
+   input embedding). The trap: ALiBi is a hard-coded linear *recency* penalty, so
+   the router then had to overcome a built-in local bias to justify the very
+   long-range retrieval that was the entire point.
+
+   The deep observation is that this is the **same** root cause as failure #1:
+   both come from **routing-by-centroid-assignment** rather than
+   **routing-by-pairwise-score**. A modern indexer (MoBA / DSA / V4-CSA) scores a
+   query against a *block or token representation* — a pairwise $q\!\cdot\!k$
+   product, like attention — so it is both natively trainable *and*
+   position-compatible: relative position lives in the score, and RoPE just
+   works, no positionless projection required. The single change from
+   vector-vs-centroid to pairwise-score dissolves the trainability failure and
+   the RoPE incompatibility at once.
+
+### Consolidated code defects
+
+Verified against the branch code. Line refs are on the `old_experiments` remote.
+
+| # | Defect | Where | Failure signature |
+|---|---|---|---|
+| 1 | **Router never trained.** `*_start_fraction` defaults to `1.0`; no from-scratch config overrides it, so masks are off in training. Model trains dense, meets hard routing only at eval. (Fix is on the *training* side: keep hard eval, set `hard_frac < 1.0`.) | Hparams default; `base:101–102`, gate `609–610` | eval blows up & seed-dependent **only at** `hard_frac=1.0`; matched schedules → gap ≈ 0 |
+| 2 | **Masked probs not renormalized.** Hard path does `probs * hardmask` with no re-softmax, shrinking output by the recall fraction. Scoped to `base` + `_mlp_q` (other branches re-softmax). | `base:653`, `mlpq:732` | the c4 `base` run eval 6.2 (renormalizing branches don't show this) |
+| 3 | **Objective rewards collapse.** `recall_loss` has no load-balance/entropy; `retrieve_loss` is negative-and-added. | all; penalty in `_retrieval_penalty` (`rp:793–802`) | total loss ↓ (even < 0) while CE ↑ |
+| 4 | **`stop_gradient` on the attention distribution** kills CE→router gradient — but **only in `base` + `_mlp_q`** (`stop_gradient(probs)*softmask`). The `_embed`/`_post_training`/`_no_stats`/`_retrieval_penalty` branches re-softmax and *do* pass CE gradient to the routing weights. | `base:611`, `mlpq:688` | mask-on training degrades CE monotonically (base/mlpq only) |
+| 5 | **Gate bias dead or hardcoded.** `q_bias` never added before `sigmoid` in `base`/`_embed`; hardcoded `+20.0` in `_retrieval_penalty` (`rp:434`), saturating the gate open and making the `_w_bias_10/_100` "sweep" a no-op. | `base:433/596`, `rp:434/599` | gate ≈ 1.0; "sweep" runs identical |
+| 6 | **Mis-horizoned post-training LR.** Post phase shrinks `steps`/`warmup` but not `steps_for_lr`, so cosine traverses ~⅓ of its arc and LR stays near-peak; then ×`post_training_mult` (0.125–5.0). | `pt:1277–1286`, `pt:1042–1046` | routing never converges; loss rises from step 0 |
+| 7 | **Stale grad-norm exclusion.** Clip filter skips `q_clusters`/`k_clusters` (names that no longer exist after the rename); the real weights `w_q_gate`/`w_k_routing` fall through and get clipped, pinning the logged `grad_norm` at 1.00 and hiding #6. `raw_grad_norm` had the true value. | `base:1030–1034` | grad-norm pinned at 1.00 everywhere |
+
+Tree A carried its own earlier versions of the same pathologies: a
+`-1e10`-everywhere softmax row that silently returns **uniform weights over
+future keys** (a causal leak) when a query's cluster matches no causal key
+(`cluster_qk_alibi:547`); centroids excluded from the clip norm but updated at LR
+1.0, with the author's own commit noting *"grad norms still exploding :("*; and
+random routing applied from step 0 (`clustering_start_fraction=0.0`) corrupting
+the most fragile phase of training.
+
+## What the field did that worked
+
+Every structural failure above has since been fixed — separately — in three
+published designs. Read the other way, they are a checklist of what this project
+got wrong:
+
+| What broke here | The fix, and who shipped it |
+|---|---|
+| Router trained by a proxy, not by CE (#1, #3, #4) | **NSA** (DeepSeek, [2502.11089](https://arxiv.org/abs/2502.11089)) is *"natively trainable... unlike baselines which train with full attention and apply sparsity post-hoc."* Sparsity is in the forward path from step 0 and the selection is differentiable end-to-end. |
+| Ad-hoc gate/router, no MoE-style balancing (#3) | **MoBA** (Moonshot/Kimi, [2502.13189](https://arxiv.org/abs/2502.13189)) — literally "Mixture of Block Attention": MoE gating routes each query to a subset of KV *blocks*, with a seamless full↔sparse switch. This is the design this project was groping toward. |
+| Router got no LM-quality signal (#4) | **DSA** (DeepSeek-V3.2, [2512.02556](https://arxiv.org/abs/2512.02556)) trains a lightweight **lightning indexer** (multi-head ReLU-gated scores) to pick top-k=2048 tokens. Its successor makes the indexer **natively trainable end-to-end** — no collapse-prone budget loss at all. |
+| Masking added compute instead of saving it | All are paired with **hardware-aligned kernels** (blockwise selection to keep memory access contiguous). Sparsity you can't turn into a faster kernel is just overhead — see below. |
+
+### DeepSeek-V4 fuses all three of these threads — and does the RoPE trick this project's author independently proposed
+
+**DeepSeek-V4** (open-weight MoE, released Apr 24 2026;
+[2606.19348](https://arxiv.org/abs/2606.19348)) is the culmination, and it is
+worth dwelling on because it is essentially *every* idea in this report, done
+right and fused into one architecture. It interleaves two attention types:
+
+- **Compressed Sparse Attention (CSA)** — compress every $m$ tokens into one KV
+  entry, then apply DSA **top-k selection over the compressed entries** via a
+  **low-rank "lightning indexer"** that is *natively trainable end-to-end* (no
+  auxiliary or distillation loss for the router). Block-level, `c4a` ≈ 4×
+  compression, $k=512$. **This is the corrected version of qk-routing**:
+  block-level, natively trainable, an indexer instead of a collapse-rewarding
+  recall budget, sparsity in the forward path from step 0.
+- **Heavily Compressed Attention (HCA)** — much more aggressive temporal
+  compression (`c128a` ≈ 128×) but **dense** attention over the few remaining
+  compressed tokens. **This is the LCM / KV-compression direction**
+  ([`lcm.qmd`](lcm.qmd)).
+
+The payoff: at 1M-token context, V4-Pro uses **27% of the single-token inference
+FLOPs and 10% of the KV cache** of V3.2, on fused kernels (compressor +
+RMSNorm + RoPE; inverse-RoPE + fp8; an FP4 indexer).
+
+**The RoPE detail is the one to notice.** V4 *shares* its K and V vectors and
+compresses them — and with a shared vector you cannot RoPE it for the key role
+without also rotating it in the value role. V4's answer is exactly the
+"rope-then-un-rope-the-output" operation: it applies RoPE to the last 64
+(decoupled) dimensions of the shared/compressed KV entry at its absolute
+position $j$, and after attention applies **RoPE with position $-i$** (the query
+position) to the *output*. The value path $\sum_j a_{ij} R_j v_j$ becomes
+$R_{-i}\sum_j a_{ij} R_j v_j = \sum_j a_{ij} R_{j-i} v_j$ — every value rotated by
+its **relative** offset to the query, restoring translation invariance under
+shared KV. It is the enabling trick for shared-KV + RoPE, and it composes
+directly with the **shared-KV work already in this repo**
+([`shared_kv.qmd`](shared_kv.qmd)): shared-KV made RoPE incompatible, and this
+is the fix.
+
+## Future directions
+
+### 1. Fix the method
+
+A corrected experiment would combine, for the first time, every fix — no run
+ever did:
+
+| Fix | Defect addressed |
+|---|---|
+| Train through the hard mask (keep hard eval; set `hard_frac < 1.0`, or use a straight-through estimator) so training sees the routing it is graded on | #1 |
+| Re-softmax (renormalize) attention after masking, on every branch | #2 |
+| Add a load-balancing / entropy term; delete the sign-flipped budget reward. Or drop the hand-built objective entirely and **distill the dense attention distribution** into the router (the DSA move) | #3 |
+| Let CE flow into the router everywhere (no `stop_gradient` on `probs`) | #4 |
+| Make the gate bias an annealed hparam, not a hardcoded constant | #5 |
+| Fix the post-training LR horizon (`steps_for_lr = steps // 3`) | #6 |
+| Fix the grad-norm exclusion to the real weight names | #7 |
+| **Route with a pairwise indexer, not vector-vs-centroid** — this is what lets you drop ALiBi for RoPE. A pairwise $q\!\cdot\!k$ score carries relative position, so RoPE works with no positionless projection; centroid routing structurally can't use RoPE. `position_embeddings.qmd` has the dense RoPE-vs-ALiBi comparison to seed the choice. (Only if you *also* compress/share KV do you additionally need V4's RoPE / inverse-RoPE-on-the-output trick.) | structural #4 |
+
+Prefer **block-level** routing (MoBA/NSA/V4-CSA) over the per-key partition mask:
+selecting contiguous KV blocks is both easier to load-balance and the only kind
+of sparsity a TPU/GPU kernel can actually exploit.
+
+### 2. Or change the mechanism, not just fix it
+
+The *goal* was shrinking the KV cache. Sparse routing is one way; **low-rank KV
+compression (MLA)** is the proven other way, and there is already an `mla` branch
+in the repo. MLA gets the same inference-time saving without a router to train,
+sidestepping the entire failure mode documented here. Given that this lineage
+literally began as an MLA experiment, closing the loop back to MLA is the most
+direct path to the original objective.
+
+But the sharper target is **DeepSeek-V4's synthesis**, because it unifies three
+things this repo already has separate branches for: shared-KV
+([`shared_kv.qmd`](shared_kv.qmd)), KV compression
+([`lcm.qmd`](lcm.qmd)), and the sparse routing documented here. V4's recipe —
+**HCA** (heavy temporal compression + dense attention, i.e. the LCM idea) on most
+layers, **CSA** (light compression + natively-trainable top-k block selection,
+i.e. the *fixed* qk-routing) on the rest, shared-KV with the RoPE/inverse-RoPE
+trick throughout — is a concrete, published blueprint for combining all three
+into one model rather than testing them in isolation.
+
+### 3. Custom kernels — the actually-important lesson
+
+The quiet reason this project was slow to iterate: **the routing never made
+training faster — it made it slower.** Masking `probs` with a `softmask` and
+adding recall/retrieve losses *adds* FLOPs and materializes extra `[L, L]`-shaped
+tensors on top of dense attention. The sparsity existed only in the *math*, never
+in the *kernel*, so there was no compute or memory payoff to offset the quality
+loss — the experiment paid the sparsity tax without collecting the sparsity
+refund. Any serious retry has to make the sparse path a *real* sparse kernel:
+
+- **On TPU (where seqax runs), the tool is Pallas + SplashAttention.** JAX ships
+  a TPU-native, sparse-aware Flash Attention
+  ([`splash_attention_kernel.py`](https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/splash_attention/splash_attention_kernel.py))
+  that takes a **block-sparse mask** and skips the masked blocks entirely — it is
+  the default attention kernel in MaxText. A MoBA/NSA-style *block* router maps
+  directly onto it: the router picks blocks, SplashAttention computes only the
+  chosen blocks, and both the compute *and* the KV read shrink by the sparsity
+  factor. This is the missing piece — the reason to make the routing block-level
+  rather than per-key.
+- **Token-level selection (DSA) needs a gather kernel**, not just a masked one:
+  after top-k the selected KV entries are scattered in memory, so the kernel must
+  gather them into a dense tile before the MXU/Tensor-Core matmul. That is a
+  harder kernel to write (Pallas on TPU, Triton on GPU) but it is what makes
+  finer-grained sparsity pay off, and it is exactly what V3.2 built.
+- **Consequence for the design:** the kernel constraint should *drive* the
+  routing granularity, not the other way around. Per-(query,key) partition masks
+  — what this project built — are the least kernel-friendly choice possible.
+  Blockwise selection (contiguous, MXU-tile-aligned) is what both makes the
+  method trainable-at-speed and gives the KV-cache saving that motivated the
+  whole thing.
+
+The honest summary is that this was the right problem approached with the wrong
+three choices — a non-differentiable/proxy-trained router, a collapse-rewarding
+objective, and math-only sparsity with no kernel — each of which the field has
+since shown how to make. A retry that trains the router through the mask,
+distills the dense distribution into it, routes at block granularity, and runs on
+SplashAttention would be testing a genuinely different hypothesis than any of
+these 230 runs did.
+
+## Limitations
+
+- All runs are ~31M parameters (c4/slim at $L=1024$, longcrawl long-context). The
+  mechanism could behave differently at scale.
+- Eval coverage is uneven: most clustering runs and several baselines logged
+  train loss only, so some cross-group comparisons rest on train loss plus the
+  runs where eval exists.
+- Many runs marked `failed` in ClearML actually finished training and eval — the
+  crash is a checkpoint-upload/teardown error after metrics were logged; those
+  eval numbers are valid. A minority are genuine collapses (ppl 12k+, duplicated
+  eval rows) and are filtered out of the figures.
+- No run combined the corrected design (train-through-hard-mask + renormalized
+  attention + load-balanced/distilled objective + a real sparse kernel). The
+  fixed method was never tested.
+- Results are loss-only. No KV-cache memory or inference latency was ever
+  measured — so even the runs that reached dense parity never demonstrated the
+  saving that was the entire point.

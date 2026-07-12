@@ -101,8 +101,8 @@ of standard ALiBi-causal attention with scores `logits` and
 1. **Route the query and the key.** Produce, per partition, a query "gate" and a
    key "assignment":
    $$
-   \texttt{q\_gate} = \sigma(g \cdot W_q) \in [0,1]^{N},\qquad
-   \texttt{k\_route} = \mathrm{softmax}(g \cdot W_k) \in \Delta^{N}
+   q_\text{gate} = \sigma(g \cdot W_q) \in [0,1]^{N},\qquad
+   k_\text{route} = \mathrm{softmax}(g \cdot W_k) \in \Delta^{N}
    $$
    where $g$ is the routing input ($\mathrm{norm}(q)$/$\mathrm{norm}(k)$ early,
    the layer-input embedding $g_x$ in the `_embed` variants) and $N$ is the

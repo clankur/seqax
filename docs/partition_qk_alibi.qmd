@@ -8,11 +8,11 @@ Hard partition routing is the intended inference behavior: at deployment each qu
 
 ## Mechanism
 
-Per attention layer, on top of standard ALiBi causal attention, new routing weights produce two soft assignments over `n_partitions`:
+Per attention layer, on top of standard ALiBi causal attention, new routing weights produce two soft assignments over `n_partitions` — a query gate (`q_gate`) and a key router (`k_route`):
 
 $$
-\texttt{q\_gate} = \sigma(g_x \cdot W_q + b_q) \in [0,1]^{n_\text{part}}, \qquad
-\texttt{k\_route} = \mathrm{softmax}(g_x \cdot W_k) \in \Delta^{n_\text{part}}
+q_\text{gate} = \sigma(g_x \cdot W_q + b_q) \in [0,1]^{n_\text{part}}, \qquad
+k_\text{route} = \mathrm{softmax}(g_x \cdot W_k) \in \Delta^{n_\text{part}}
 $$
 
 where $g_x$ is the layer input embedding. Their outer product over partitions gives a soft keep-probability per (query, key) pair, `softmask`, combined with the causal mask. A hard variant — `q_gate > hard_q_threshold` and $\arg\max$ over `k_route` — is the **inference path** (the actual KV-cache saving), so eval forces it via `total_steps=0`. Routing weights are trained by auxiliary terms (`recall_loss`, `retrieve_loss`), not by the LM loss directly.

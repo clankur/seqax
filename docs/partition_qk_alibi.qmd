@@ -1,0 +1,343 @@
+---
+title: "Routing queries to KV-cache partitions"
+---
+
+The `parition_qk_alibi` family tested learned sparse attention: each query routes to a small set of *partitions* of the KV cache instead of attending densely, on top of ALiBi. Six branches were tried — `parition_qk_alibi`, `_embed`, `_embed_mlp_q`, `_embed_post_training`, `_embed_post_training_no_stats`, `_embed_post_training_retrieval_penalty`. Across 75 runs on three datasets, no configuration beat — or matched — the dense ALiBi baseline it started from.
+
+Hard partition routing is the intended inference behavior: at deployment each query attends only within its routed partition(s), so evaluation correctly forces the hard mask. The failure has two layers. First, the from-scratch configs leave the mask-activation schedule at its Hparams default of `1.0` (no config overrides it), so the hard mask was **never used during training** — the model trained dense and met its own routing for the first time at eval, producing a large, seed-dependent train/eval gap. Schedules that *do* reach the hard mask during training close that gap to ≈0. What remains once the gap is closed is the method's real ceiling: matched-schedule and post-training runs are consistent train-to-eval but still land ~0.1–0.4 nats above dense, because the routing objective and masked-attention math (defects #2–#5 below) cannot learn a sparse pattern that preserves quality.
+
+## Mechanism
+
+Per attention layer, on top of standard ALiBi causal attention, new routing weights produce two soft assignments over `n_partitions`:
+
+$$
+\texttt{q\_gate} = \sigma(g_x \cdot W_q + b_q) \in [0,1]^{n_\text{part}}, \qquad
+\texttt{k\_route} = \mathrm{softmax}(g_x \cdot W_k) \in \Delta^{n_\text{part}}
+$$
+
+where $g_x$ is the layer input embedding. Their outer product over partitions gives a soft keep-probability per (query, key) pair, `softmask`, combined with the causal mask. A hard variant — `q_gate > hard_q_threshold` and $\arg\max$ over `k_route` — is the **inference path** (the actual KV-cache saving), so eval forces it via `total_steps=0`. Routing weights are trained by auxiliary terms (`recall_loss`, `retrieve_loss`), not by the LM loss directly.
+
+Two step-gated switches control when the masks enter the forward pass:
+
+- `apply_softmask` activates at `step >= softmask_start_fraction * total_steps`
+- `apply_hardmask` activates at `step >= hardmask_start_fraction * total_steps`
+
+The lineage adds incrementally: `_embed` routes off $g_x$ instead of $q/k$; `_mlp_q` adds an MLP for the query gate; `_post_training` freezes a pretrained dense model and fine-tunes only the routing weights; `_no_stats` removes diagnostic logging only (no training change); `_retrieval_penalty` adds a sparsity-vs-recall budget loss.
+
+## Code defects
+
+Branch line references are on the `old_experiments` remote (`github.com/clankur/experimental`). Each defect maps to a measured failure signature below.
+
+| # | Defect | Branch / location | Failure signature |
+|---|---|---|---|
+| 1 | **Training never used the routing.** Hard-routed eval is the intended inference path (forced via `total_steps=0`, which is correct), but the from-scratch configs leave `*_start_fraction` at its default `1.0` (no config overrides it), so the soft/hard masks never activate during training. The model trains dense and meets its own routing only at eval. This is a schedule/protocol choice, not a code bug — and the fix is on the *training* side. | Hparams default (`*_start_fraction`) | train ≈ dense, eval blows up & **seed-dependent — but only at `hard_frac=1.0`**; schedules that reach the hard mask in training close the gap (below) |
+| 2 | **Masked probs not renormalized.** Hard path multiplies `probs * hardmask` without re-softmax, shrinking the attention output by the recall fraction. The other four branches re-softmax the masked logits, so this bites `base`/`_mlp_q` only. | base, `_mlp_q` | eval 3.49→6.2 (c4 `base` run) |
+| 3 | **Routing objective rewards collapse.** `recall_loss = -log(cluster_recall / total_raw_probs)` is minimized by routing everything to one partition; no load-balancing/entropy term. `retrieve_loss` (penalty branch) is *negative and added*, so the optimizer lowers total loss by sparsifying at CE's expense. | all; penalty term in `_retrieval_penalty` | total loss ↓ (even negative) while CE ↑ |
+| 4 | **`stop_gradient` on the attention distribution.** In `base`/`_mlp_q` the soft path is `stop_gradient(probs) * softmask`, so CE gives the routing no gradient. The `_embed`/`_post_training`/`_no_stats`/`_retrieval_penalty` branches reworked this to a re-softmax with `log(softmask)` as an additive bias and **no** `stop_gradient` — there CE *does* reach the routing weights (only `nq`/`nk` are stop-gradiented). | base, `_mlp_q` | mask-on training degrades CE monotonically (base/`_mlp_q`) |
+| 5 | **No annealing.** `q_bias` is dead in base/`_embed`; hardcoded `+20.0` in `_retrieval_penalty`, leaving the gate saturated open — and making the `_w_bias_10/_100` "bias sweep" a no-op. | `_embed`, `_retrieval_penalty` (`train.py:434`) | gate ≈ 0.74–1.0; "sweep" runs identical |
+| 6 | **Mis-horizoned post-training LR.** Post phase uses `steps//3`, `warmup//30`, but cosine runs over the original horizon, then ×`post_training_mult` (0.125–5.0). | `_post_training` | routing never converges; loss rises from step 0 |
+| 7 | **Stale grad-norm exclusion.** Clip filter skips `q_clusters`/`k_clusters` (names that don't exist); real routing weights `w_q_gate`/`w_k_routing` are clipped. | all branches | grad-norm pinned at 1.00 everywhere, masking #6 |
+
+```{python}
+import json
+import csv
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.io as pio
+
+pio.renderers.default = "plotly_mimetype+notebook_connected"
+
+ROOT = Path("../clearml_experiments")
+
+# Dense ALiBi baselines (train EMA, eval) — completed runs in each group.
+BASELINES = {
+    "c4": {"path": "c4_v4_32_31m/alibi", "eval": 3.486, "train": 3.48},
+    "slim": {"path": "slim_v4_32_31m/alibi", "eval": None, "train": 1.86},
+    "longcrawl": {"path": "longcrawl_v4_32_31m/alibi", "eval": 3.168, "train": 3.21},
+}
+
+# Partition variant folders, by dataset and lineage segment.
+SEGMENTS = {
+    ("c4", "base"): "c4_v4_32_31m/parition_qk_alibi",
+    ("c4", "embed"): "c4_v4_32_31m/parition_qk_alibi_embed",
+    ("c4", "post_training"): "c4_v4_32_31m/parition_qk_alibi_embed_post_training",
+    ("c4", "retrieval_penalty"): "c4_v4_32_31m/parition_qk_alibi_embed_post_training_retrieval_penalty",
+    ("slim", "embed"): "slim_v4_32_31m/parition_qk_alibi_embed",
+    ("longcrawl", "post_training"): "longcrawl_v4_32_31m/parition_qk_alibi_embed_post_training",
+}
+
+PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
+           "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+def calculate_ema(data, smoothing=0.97):
+    ema = [data[0]]
+    for value in data[1:]:
+        ema.append(ema[-1] * smoothing + value * (1 - smoothing))
+    return ema
+
+
+def _read_csv(path):
+    if not path.exists():
+        return None
+    rows = list(csv.DictReader(open(path)))
+    if not rows:
+        return None
+    steps = [int(float(r["step"])) for r in rows]
+    vals = [float(r["value"]) for r in rows]
+    return steps, vals
+
+
+def _config(metadata):
+    cfg = {}
+    for k, v in metadata.get("hyperparameters", {}).items():
+        if k.startswith("Hydra/model.") or k.startswith("Hydra/training."):
+            cfg[k.split(".", 1)[1]] = v
+    return cfg
+
+
+def _load_run(run_dir):
+    md = json.loads((run_dir / "metadata.json").read_text())
+    m = run_dir / "metrics"
+    train = _read_csv(m / "loss_loss.csv")
+    pt = _read_csv(m / "post_train_loss_post_train_loss.csv")
+    pt_total = _read_csv(m / "post_train_total_loss_post_train_total_loss.csv")
+    ev = _read_csv(m / "final_loss_eval.csv")
+    ppl = _read_csv(m / "final_perplexity_eval.csv")
+    cfg = _config(md)
+    return {
+        "name": md["experiment_name"],
+        "status": md["status"],
+        "config": cfg,
+        "train_steps": train[0] if train else None,
+        "train_loss": train[1] if train else None,
+        "train_ema": calculate_ema(train[1])[-1] if train else None,
+        "pt_steps": pt[0] if pt else None,
+        "pt_loss": pt[1] if pt else None,
+        "pt_total_loss": pt_total[1] if pt_total else None,
+        "pt_start": pt[1][0] if pt else None,
+        "pt_end": calculate_ema(pt[1])[-1] if pt else None,
+        "eval": ev[1][-1] if ev else None,
+        "ppl": ppl[1][-1] if ppl else None,
+        "n_part": int(cfg.get("n_partitions", 0)),
+        "soft_frac": float(cfg.get("softmask_start_fraction", -1)),
+        "hard_frac": float(cfg.get("hardmask_start_fraction", -1)),
+        "ptm": float(cfg["post_training_mult"]) if "post_training_mult" in cfg else None,
+        "rscale": float(cfg["retrieval_scale"]) if "retrieval_scale" in cfg else None,
+        "variant": cfg.get("variant", ""),
+        "apply_alibi": cfg.get("apply_alibi", "True"),
+    }
+
+
+def load_segment(dataset, segment):
+    return [_load_run(d) for d in sorted((ROOT / SEGMENTS[(dataset, segment)]).iterdir()) if d.is_dir()]
+
+
+def short_variant(v):
+    return (v.replace("embedding_routed_partition", "routed")
+             .replace("new_softmask_probs_budget", "softmask_budget")
+             .replace("new_softmask_probs", "softmask")
+             .replace("retrieve_penalty_", "")
+             .replace("\\", "") or "default")
+```
+
+## Training looks healthy: from-scratch runs track the dense baseline
+
+On c4, the from-scratch partition runs train to the same loss as dense ALiBi — because with `softmask_start_fraction = hardmask_start_fraction = 1.0` the routing masks are never in the forward path during training (defect #1). The model is plain dense ALiBi attention throughout. Runs that turn masking on earlier (`soft=0.5/hard=0.8`) are visibly worse, the only effect of the routing being to *degrade* the CE it cannot receive gradient for (defects #3, #4).
+
+```{python}
+runs = load_segment("c4", "base") + load_segment("c4", "embed")
+runs = [r for r in runs if r["train_loss"] is not None]
+
+fig = go.Figure()
+base = BASELINES["c4"]
+fig.add_hline(y=base["eval"], line=dict(color="black", dash="dash"),
+              annotation_text=f"dense ALiBi (eval {base['eval']})", annotation_position="top right")
+for i, r in enumerate(runs):
+    label = f"soft={r['soft_frac']}/hard={r['hard_frac']}"
+    ema = calculate_ema(r["train_loss"])
+    color = PALETTE[i % len(PALETTE)]
+    fig.add_trace(go.Scatter(x=r["train_steps"], y=r["train_loss"], mode="lines",
+                             line=dict(color=color, width=1), opacity=0.15,
+                             legendgroup=label, showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=r["train_steps"], y=ema, mode="lines", name=label,
+                             legendgroup=label, line=dict(color=color, width=2),
+                             hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.3f}<extra></extra>"))
+fig.update_layout(xaxis_title="Step", yaxis_title="Training loss", height=520,
+                  yaxis_range=[3.3, 4.5],
+                  legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+                  margin=dict(l=60, r=20, t=20, b=90))
+fig.show()
+```
+
+## The intended inference path is hard routing — training must match it
+
+The same from-scratch runs evaluated with the hard partition routing — the real inference behavior — show the gap. Plotting each run's training loss against its eval loss, points on the diagonal have no gap; points above it are runs whose hard-routed eval is worse than training. The dense baseline sits on the diagonal. Several partition runs — at **identical config, differing only by seed** — land either on the diagonal or far above it (c4: eval 3.48 vs 6.2; slim 512-partition: eval 1.85 vs 4.58).
+
+```{python}
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=[1.7, 6.5], y=[1.7, 6.5], mode="lines",
+                         line=dict(color="black", dash="dot"), name="eval = train", hoverinfo="skip"))
+
+groups = {
+    "c4 partition": load_segment("c4", "base") + load_segment("c4", "embed"),
+    "slim partition": load_segment("slim", "embed"),
+}
+colors = {"c4 partition": "#d62728", "slim partition": "#1f77b4"}
+for gname, gruns in groups.items():
+    pts = [r for r in gruns if r["train_ema"] is not None and r["eval"] is not None]
+    fig.add_trace(go.Scatter(
+        x=[r["train_ema"] for r in pts], y=[r["eval"] for r in pts],
+        mode="markers", name=gname, marker=dict(color=colors[gname], size=10, opacity=0.8),
+        text=[f"{short_variant(r['variant'])}<br>n_part={r['n_part']} soft={r['soft_frac']}/hard={r['hard_frac']}" for r in pts],
+        hovertemplate="%{text}<br>train=%{x:.2f} eval=%{y:.2f}<extra></extra>"))
+
+# dense baselines as stars
+fig.add_trace(go.Scatter(x=[BASELINES["c4"]["train"]], y=[BASELINES["c4"]["eval"]],
+                         mode="markers", name="c4 dense", marker=dict(symbol="star", size=16, color="#d62728")))
+fig.update_layout(xaxis_title="Training loss (EMA)", yaxis_title="Eval loss (hard routing)",
+                  height=560, legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+                  margin=dict(l=60, r=20, t=20, b=80))
+fig.show()
+```
+
+### Matching the schedule closes the gap
+
+Grouping the c4 from-scratch runs by `hardmask_start_fraction` shows the gap is a schedule artifact, not an inherent property of hard routing. Whenever the hard mask is reached before the end of training (`hard_frac < 1.0`), eval tracks training to within 0.06 — exactly as it should, since train and eval then use the same routing. Only the `hard_frac = 1.0` runs (hard mask never trained) diverge, and they do so catastrophically and seed-dependently when the routing weights are left effectively untrained (the `partition_disabled` seed at eval 6.2).
+
+```{python}
+runs = load_segment("c4", "base") + load_segment("c4", "embed")
+rows = []
+for r in runs:
+    if r["train_ema"] is None or r["eval"] is None:
+        continue
+    rows.append({"variant": short_variant(r["variant"]),
+                 "soft_frac": r["soft_frac"], "hard_frac": r["hard_frac"],
+                 "train": round(r["train_ema"], 2), "eval": round(r["eval"], 2),
+                 "gap": round(r["eval"] - r["train_ema"], 2)})
+df = pd.DataFrame(rows).sort_values(["hard_frac", "gap"]).reset_index(drop=True)
+df.style.format(precision=2).set_caption(
+    "c4 from-scratch: train/eval gap by mask schedule. hard_frac<1.0 (hard mask trained) → gap≈0; hard_frac=1.0 (never trained) → mismatch.")
+```
+
+The cost of matching is absolute quality: training through the hard mask pulls the eval loss to 3.55–3.74 versus dense 3.49. The mismatch is removable; the ~0.1–0.25-nat deficit is the routing mechanism's ceiling. On the `base` branch, the un-renormalized masked attention (defect #2) is what makes the *unmatched* `hard_frac=1.0` case so violent and seed-dependent (the c4 eval-6.2 run) rather than merely worse. The `_embed` branch re-softmaxes, so its `hard_frac=1.0` collapses (the slim runs below) are pure train/eval mismatch (defect #1), not #2.
+
+The slim runs make the dependence on the routing variant explicit: variants that retrieve nearly all keys (`soft_retrieve_gx/nx`, low scale) stay near the baseline; the plain `routed` variant at 512 partitions collapses to eval 4.4–4.6.
+
+```{python}
+rows = []
+for r in load_segment("slim", "embed"):
+    if r["eval"] is None:
+        continue
+    rows.append({"variant": short_variant(r["variant"]), "n_part": r["n_part"],
+                 "train": round(r["train_ema"], 2), "eval": round(r["eval"], 2),
+                 "ppl": round(r["ppl"], 1), "gap": round(r["eval"] - r["train_ema"], 2)})
+df = pd.DataFrame(rows).sort_values("gap").reset_index(drop=True)
+df.style.format(precision=2).set_caption("slim from-scratch: eval gap by routing variant (dense baseline train≈1.86)")
+```
+
+## Post-training: loss only ever rises
+
+Post-training is the clean test of the ceiling: these runs use `softmask_start_fraction=0.0` and `hardmask_start_fraction=0.9`, so they train through the soft mask and into the hard mask — there is no train/eval mismatch here, and indeed the post-training CE end and the hard eval agree (e.g. 3.33 vs 3.37). Freezing a pretrained dense model and fine-tuning only the routing weights (`_post_training`) still cannot recover the attention quality lost to the partition mask. On longcrawl, every run's post-training CE rises monotonically from its step-0 minimum (the dense starting point) — the mis-horizoned LR schedule (defect #6) and the collapse-rewarding objective (#3, #4) push the loss up, not down. The best partition result (n_part=128, `post_training_mult=0.25`) reaches eval 3.37, still **+0.2 nats above** the dense baseline of 3.17.
+
+```{python}
+runs = [r for r in load_segment("longcrawl", "post_training") if r["pt_loss"] is not None]
+fig = go.Figure()
+fig.add_hline(y=BASELINES["longcrawl"]["eval"], line=dict(color="black", dash="dash"),
+              annotation_text="dense ALiBi (eval 3.17)", annotation_position="bottom right")
+for i, r in enumerate(sorted(runs, key=lambda x: x["pt_end"])):
+    label = f"n_part={r['n_part']} ptm={r['ptm']} alibi={r['apply_alibi']}"
+    color = PALETTE[i % len(PALETTE)]
+    fig.add_trace(go.Scatter(x=r["pt_steps"], y=r["pt_loss"], mode="lines", name=label,
+                             line=dict(color=color, width=2),
+                             hovertemplate="%{fullData.name}<br>step=%{x}<br>CE=%{y:.3f}<extra></extra>"))
+fig.update_layout(xaxis_title="Post-training step", yaxis_title="Post-training CE loss", height=540,
+                  legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+                  margin=dict(l=60, r=20, t=20, b=110))
+fig.show()
+```
+
+```{python}
+rows = []
+for r in load_segment("longcrawl", "post_training"):
+    if r["eval"] is None:
+        continue
+    rows.append({"n_part": r["n_part"], "ptm": r["ptm"], "alibi": r["apply_alibi"],
+                 "CE_start": round(r["pt_start"], 2) if r["pt_start"] else None,
+                 "CE_end": round(r["pt_end"], 2) if r["pt_end"] else None,
+                 "eval": round(r["eval"], 2), "ppl": round(r["ppl"], 1)})
+df = pd.DataFrame(rows).sort_values("eval").reset_index(drop=True)
+df.style.format(precision=2).set_caption("longcrawl post-training (dense baseline eval 3.17). Loss rises from step 0; never beats dense.")
+```
+
+## The retrieval penalty optimizes the wrong thing
+
+The `_retrieval_penalty` branch adds `retrieve_loss = mean_layers log(retrieved_fraction)`, a *negative* quantity that is *added* to the loss — so total loss drops when the model retrieves fewer keys, regardless of CE. The plot below shows the trap directly: total loss (with the penalty) falls below zero while the actual CE climbs. The optimizer is cashing in language-modeling quality for the sparsity reward (defect #3). The two runs where routing genuinely engaged reached eval perplexity **12k–13k** (CE ≈ 9.5, near random init).
+
+```{python}
+runs = [r for r in load_segment("c4", "retrieval_penalty") if r["pt_loss"] is not None]
+# pick the clearest example: one with both CE and total-loss curves that diverge
+r = max(runs, key=lambda x: (x["pt_end"] or 0))
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=r["pt_steps"], y=r["pt_loss"], mode="lines", name="CE loss (LM quality)",
+                         line=dict(color="#d62728", width=2)))
+if r["pt_total_loss"]:
+    fig.add_trace(go.Scatter(x=r["pt_steps"], y=r["pt_total_loss"], mode="lines",
+                             name="total loss (CE + penalty)", line=dict(color="#1f77b4", width=2)))
+fig.add_hline(y=0, line=dict(color="gray", dash="dot"))
+fig.update_layout(xaxis_title="Post-training step", yaxis_title="Loss",
+                  title=f"retrieval_penalty: {short_variant(r['variant'])}, rscale={r['rscale']}",
+                  height=520, legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+                  margin=dict(l=60, r=20, t=40, b=80))
+fig.show()
+```
+
+```{python}
+rows = []
+for r in load_segment("c4", "retrieval_penalty"):
+    if r["eval"] is None:
+        continue
+    rows.append({"variant": short_variant(r["variant"]), "rscale": r["rscale"],
+                 "CE_end": round(r["pt_end"], 2) if r["pt_end"] else None,
+                 "eval": round(r["eval"], 2), "ppl": round(r["ppl"], 1), "status": r["status"]})
+df = pd.DataFrame(rows).sort_values("eval").reset_index(drop=True)
+df.style.format(precision=2).set_caption("c4 retrieval_penalty. eval≈3.49 = gate stayed open (no routing); eval≈9.5 = routing engaged → collapse.")
+```
+
+The `eval ≈ 3.49` rows are an artifact: the `+20` gate bias (defect #5) keeps the gate saturated open, so those runs are still effectively the dense model — the partitioning never engaged. Whenever the sparse routing actually applies (the two completed runs, and the hard-eval path), CE explodes. The bias "sweep" (`_w_bias_10` vs `_w_bias_100`) had no effect because the bias was hardcoded.
+
+## Headline numbers
+
+```{python}
+summary = pd.DataFrame([
+    {"segment": "dense ALiBi (c4)", "best_eval": 3.49, "best_ppl": 32.6, "notes": "baseline"},
+    {"segment": "dense ALiBi (longcrawl)", "best_eval": 3.17, "best_ppl": 23.8, "notes": "baseline"},
+    {"segment": "c4 base / embed (scratch)", "best_eval": 3.48, "best_ppl": 32.6, "notes": "matched schedule → eval≈train 3.55-3.74; hard_frac=1.0 → 6.2"},
+    {"segment": "slim embed (scratch)", "best_eval": 1.85, "best_ppl": 6.3, "notes": "= dense only for full-retrieval variants; 4.58 worst"},
+    {"segment": "c4 post_training", "best_eval": 3.49, "best_ppl": 32.7, "notes": "loss rises from step 0; never beats dense"},
+    {"segment": "longcrawl post_training", "best_eval": 3.37, "best_ppl": 29.2, "notes": "best partition result, +0.2 nats vs dense"},
+    {"segment": "c4 retrieval_penalty", "best_eval": 3.49, "best_ppl": 32.6, "notes": "3.49 = no routing; 9.5 (ppl 12k) when engaged"},
+])
+summary.style.format(precision=2).hide(axis="index")
+```
+
+## Limitations
+
+- All runs are 31M parameters; c4/slim at $L=1024$, longcrawl at long context. The mechanism could behave differently at scale.
+- Many runs are marked `failed` in ClearML but completed training and the final eval — the crash is a checkpoint-upload/teardown error after metrics were logged. Their eval numbers are valid and are used here.
+- The from-scratch runs almost all used `*_start_fraction = 1.0`, so the soft→hard annealing schedule was never actually trained through. No run combines early soft-masking, renormalized probabilities, and a load-balanced objective — i.e. the corrected design was never tested.
+- No KV-cache memory or latency was measured; results are loss-only.
+
+## What a corrected experiment would need
+
+| Fix | Defect addressed |
+|---|---|
+| Train through the hard mask — keep hard eval, but set `hardmask_start_fraction < 1.0` (or use a straight-through estimator) so training sees the routing it is graded on | #1 |
+| Re-softmax (renormalize) attention after masking | #2 |
+| Add a load-balancing / entropy term; remove the sign-flipped budget reward | #3 |
+| Let CE flow into the routing (drop `stop_gradient` on `probs`) | #4 |
+| Make the gate bias an annealed hparam, not a hardcoded constant | #5 |
+| Use a proper post-training LR horizon (`steps_for_lr = steps//3`) | #6 |
+| Fix the grad-norm exclusion to the real weight names | #7 |

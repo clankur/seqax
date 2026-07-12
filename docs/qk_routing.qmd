@@ -328,14 +328,33 @@ method would not have worked even bug-free, for four structural reasons:
    one partition and opening that gate maximizes recall — a valid minimizer that
    destroys the whole point. The retrieval penalty made this worse by adding a
    sparsity reward that trades directly against CE.
-4. **ALiBi's recency prior fought the retrieval thesis.** ALiBi is a hard-coded
-   linear distance penalty — it hands the model locality for free. But the entire
-   value proposition of routing is attending to a *distant, relevant* partition.
-   The router had to overcome a built-in local bias just to justify any
-   long-range retrieval. A distance-neutral encoding (RoPE, or NoPE + a decoupled
-   RoPE sub-vector) is a far better substrate for *learned* sparsity — and the
-   routing was already running on the positionless projection, so the position
-   encoding was a free variable that happened to be set adversarially.
+4. **The router design forced ALiBi, and ALiBi's recency prior then fought the
+   retrieval thesis.** The router assigned *each individual q and k vector* to a
+   partition by dotting it against fixed learned centroids
+   (`q_c = einsum(nq, q_clusters)`). That is a per-vector, nearest-centroid
+   decision — and it *requires a positionless representation*, because RoPE
+   rotates each vector by its **absolute** position: $q_i\!\cdot\!c = (R_i q)\cdot
+   c$ varies with position even for identical content, so the same token would
+   route to different partitions depending on where it sits, and a query and its
+   relevant key would rotate into different partitions. RoPE's relative-position
+   property lives only in the $q\!\cdot\!k$ product ($q^\top R_{j-i} k$), never in
+   the individual vectors the router sees. So RoPE was structurally incompatible
+   with centroid routing, and ALiBi — a scalar logit bias that keeps position
+   *out* of q/k — was the workaround (commit `a7ccfdb` "disable pes unless
+   specified"; the `_nope` naming; `be28001` moving routing onto the un-RoPE'd
+   input embedding). The trap: ALiBi is a hard-coded linear *recency* penalty, so
+   the router then had to overcome a built-in local bias to justify the very
+   long-range retrieval that was the entire point.
+
+   The deep observation is that this is the **same** root cause as failure #1:
+   both come from **routing-by-centroid-assignment** rather than
+   **routing-by-pairwise-score**. A modern indexer (MoBA / DSA / V4-CSA) scores a
+   query against a *block or token representation* — a pairwise $q\!\cdot\!k$
+   product, like attention — so it is both natively trainable *and*
+   position-compatible: relative position lives in the score, and RoPE just
+   works, no positionless projection required. The single change from
+   vector-vs-centroid to pairwise-score dissolves the trainability failure and
+   the RoPE incompatibility at once.
 
 ### Consolidated code defects
 
@@ -425,7 +444,7 @@ ever did:
 | Make the gate bias an annealed hparam, not a hardcoded constant | #5 |
 | Fix the post-training LR horizon (`steps_for_lr = steps // 3`) | #6 |
 | Fix the grad-norm exclusion to the real weight names | #7 |
-| **Swap ALiBi for RoPE or NoPE + decoupled-RoPE** so the position encoding stops fighting long-range retrieval. `position_embeddings.qmd` already has the dense RoPE-vs-ALiBi comparison at this scale to seed the choice; if combined with shared-KV, use V4's RoPE / inverse-RoPE-on-the-output trick (see above) | structural #4 |
+| **Route with a pairwise indexer, not vector-vs-centroid** — this is what lets you drop ALiBi for RoPE. A pairwise $q\!\cdot\!k$ score carries relative position, so RoPE works with no positionless projection; centroid routing structurally can't use RoPE. `position_embeddings.qmd` has the dense RoPE-vs-ALiBi comparison to seed the choice. (Only if you *also* compress/share KV do you additionally need V4's RoPE / inverse-RoPE-on-the-output trick.) | structural #4 |
 
 Prefer **block-level** routing (MoBA/NSA/V4-CSA) over the per-key partition mask:
 selecting contiguous KV blocks is both easier to load-balance and the only kind

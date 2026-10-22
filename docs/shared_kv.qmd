@@ -270,9 +270,55 @@ get_eval_metrics_table(completed_1b, config_1b, defaults=SHARED_DEFAULTS_1B)
 
 At matched learning rate, shared KV is 0.025 nats behind at 270M and 0.018 nats behind at 1B, while using 50% fewer KV projection parameters and halving KV cache memory.
 
+## Partial comparison: shared KV vs GQA
+
+A same-scale GQA run at 270M on C4 is the only recoverable comparison against another KV-reduction method. It and a companion shared KV run were trained under muP and crashed at step 5,630 — 24% of the 23,000-step schedule — on a data-loader error. Their loss and learning-rate curves survive; the model configs and any completed checkpoint do not. No MQA run at this scale is recoverable.
+
+Both runs share initialization, seed, and data order: step-0 loss is 10.40 for each. They differ in peak learning rate — GQA 0.0090, shared KV 0.0073, a constant 1.23x ratio at every step — which confounds the comparison.
+
+```{python}
+from plotly.subplots import make_subplots
+
+PARTIAL_270M = {
+    "shared KV (muP)": Path("../clearml_experiments/c4_a100x8x4_270m/shared_kv_mup/270m_shared_kv_mup_dd6001c591af4294973284787cb52bfe"),
+    "GQA (muP)": Path("../clearml_experiments/c4_a100x8x4_270m/gqa_mup/270m_gqa_mup_3b112125e3994ac382ed3a7d9454ffe7"),
+}
+colors = {"shared KV (muP)": "#1f77b4", "GQA (muP)": "#ff7f0e"}
+
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+for name, run_dir in PARTIAL_270M.items():
+    steps, loss = _read_csv(run_dir / "metrics" / "loss_loss.csv")
+    _, lr = _read_csv(run_dir / "metrics" / "learning_rate_learning_rate.csv")
+    ema = calculate_ema(loss)
+    c = colors[name]
+    fig.add_trace(go.Scatter(x=steps, y=loss, mode="lines", line=dict(color=c, width=1),
+                             opacity=0.15, showlegend=False, hoverinfo="skip"), secondary_y=False)
+    fig.add_trace(go.Scatter(x=steps, y=ema, mode="lines", name=name, line=dict(color=c, width=2),
+                             hovertemplate="%{fullData.name}<br>step=%{x}<br>loss=%{y:.4f}<extra></extra>"),
+                  secondary_y=False)
+    fig.add_trace(go.Scatter(x=steps, y=lr, mode="lines", name=f"{name} — lr",
+                             line=dict(color=c, width=1, dash="dot"), opacity=0.6,
+                             hovertemplate="lr=%{y:.5f}<extra></extra>"), secondary_y=True)
+fig.update_yaxes(title_text="Training loss", range=[3.0, 4.6], secondary_y=False)
+fig.update_yaxes(title_text="Learning rate", secondary_y=True)
+fig.update_layout(xaxis_title="Step", height=520, hovermode="closest",
+                  legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+                  margin=dict(l=60, r=60, t=20, b=100))
+fig.show()
+```
+
+At the last recovered step GQA leads shared KV by 0.03 nats. The gap narrows monotonically over training — 0.10 nats at step 1,000, 0.03 at step 5,630 — tracking the 1.23x learning-rate difference rather than a fixed architecture gap. The comparison is directional only: 24% trained, learning-rate-confounded, and under muP rather than the standard parametrization of the completed runs above.
+
+| Step 5,630 (24% of schedule) | shared KV (muP) | GQA (muP) |
+|---|---|---|
+| EMA loss (smoothing 0.97) | 3.13 | 3.10 |
+| mean of last 50 steps | 3.13 | 3.10 |
+| peak learning rate | 0.0073 | 0.0090 |
+| step-0 loss (shared init) | 10.40 | 10.40 |
+
 ## Limitations
 
-- All baselines use MHA (n_kv=16, n_q_per_kv=1). No comparison against GQA or MQA, which also reduce KV cache.
+- The completed baselines use MHA (n_kv=16, n_q_per_kv=1). The only GQA comparison is the partial muP run above (24% trained, learning-rate-confounded). No MQA run at this scale is recoverable.
 - Only one shared KV run exists at each scale.
 - No eval loss, perplexity, or downstream task metrics were recorded. All comparisons use training loss only.
 - No inference latency or KV cache memory measurements were taken.
